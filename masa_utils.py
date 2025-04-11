@@ -3,7 +3,7 @@ from scipy import optimize
 from scipy.constants import mu_0, epsilon_0
 from scipy import fftpack
 from scipy import sparse
-from scipy.special import factorial
+from scipy.special import factorial, roots_legendre, eval_legendre
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d, CubicSpline,splrep, BSpline
 from scipy.sparse import csr_matrix, csc_matrix
@@ -18,7 +18,7 @@ import  os
 from abc import ABC, abstractmethod
 eps= np.finfo(float).eps
 
-class TikonovInversion:
+class TikonovInversion():
     def __init__(self, G_f, Wd, alphax=1.,Wx=None,
         alphas=1., Ws=None, m_ref=None,Proj_m=None,m_fix=None,
         sparse_matrix=False
@@ -197,21 +197,32 @@ class projection_convex_set:
             x_c_0 = x_c_1
         return x_c_1
 
-class empymod_IPinv:
 
-    def __init__(self, model_base, nlayer,
-        m_ref=None, nD=0, nlayer_fix=0, Prj_m=None, m_fix=None,
-        nM_r = None, nM_m = None, nM_t= None, nM_c=None,
+class BaseSimulation:
+    @abstractmethod
+    def dpred(self,m):
+        pass
+    @abstractmethod
+    def J(self,m):
+        pass
+    @abstractmethod
+    def project_convex_set(self,m):
+        pass
+
+class empymod_IP_simulation(BaseSimulation):
+    def __init__(self, model_base, nlayer, tx_height, m_depth=False,
+        nD=0, nlayer_fix=0, Prj_m=None, m_fix=None,
+        nM_r = None, nM_m = None, nM_t= None, nM_c=None, nM_d= None,
         recw=None,resmin=1e-3 , resmax=1e6, chgmin=1e-3, chgmax=0.9,
         taumin=1e-6, taumax=1e-1, cmin= 0.4, cmax=0.9,
-        Wd = None, Ws=None,Ws_threshold=1e-12, Wx=None, alphax=None, alphas=None,
         cut_off=None,filt_curr = None,  window_mat = None,
         ):
         self.model_base = model_base
         self.nlayer = int(nlayer)
         self.nlayer_fix = int(nlayer_fix)
+        self.m_depth = m_depth
+        self.tx_height = tx_height
         self.nP = 4*(nlayer + nlayer_fix)
-        self.m_ref = m_ref
         self.Prj_m = Prj_m  
         self.m_fix = m_fix
         self.recw = recw
@@ -235,12 +246,6 @@ class empymod_IPinv:
         self.taumax = taumax
         self.cmin = cmin
         self.cmax = cmax
-        self.Wd = Wd
-        self.Ws = Ws
-        self.Ws_threshold = Ws_threshold
-        self.Wx = Wx
-        self.alphax = alphax
-        self.alphas = alphas
         self.cut_off = cut_off
         self.filt_curr = filt_curr
         self.window_mat = window_mat
@@ -322,29 +327,52 @@ class empymod_IPinv:
         assert self.nP == 4*(nlayer_sum)
         assert self.nM == 2*nlayer
         return Prj_m, m_fix
+    
+    def deepsea_one_IP_layer(self, res_sea,
+         eta_sea=0,  tau_sea=1e-3, c_sea=0.4,
+         eta_base=0, tau_base=1e-2, c_base=0.4
+         ):
+        """
+        layer_0 :sea
+        layer_1 : target layer
+        layer_2 : non IP bottom layer
+        m[0]   : resistivity of the layer
+        m[1:2] : resistivity of bottom layer in log
+        m[2:3] : chargeability of the layer
+        m[3:4] : time constant of the layer in log
+        m[4:5] : exponent C of the layer
+        m[5]   : Thickness of the layer in log
+        """
+        nlayer=2
+        nlayer_fix =1
+        nlayer_sum = nlayer + nlayer_fix
+        # resistivity
+        Prj_m_diag = np.diag(np.r_[
+                    0,np.ones(nlayer  ),  # resistivity
+                    0,np.ones(nlayer-1),0, # chargeability
+                    0,np.ones(nlayer-1),0, # time constant
+                    0,np.ones(nlayer-1),0, # exponent C
+                    0,np.ones(nlayer-1) # depth
+                    ])
+        non_zero_columns = ~np.all(Prj_m_diag == 0, axis=0)
+        Prj_m = Prj_m_diag[:, non_zero_columns]
 
-    def get_Wx_sea_basement(self):
-        nlayer = self.nlayer
-        nlayer_fix=2
-        nlayer_sum = nlayer+nlayer_fix
-        nM = self.nM
-        nP = self.nP
-        Wx = np.zeros((nM,nP))
-        if nlayer == 1:
-            print("No smoothness for one layer model")
-            self.Wx = Wx
-            return Wx
-        Wx_block = np.zeros((nlayer-1, nlayer_sum))
-        Wx_block[:,1:-2] = np.eye(nlayer-1)
-        Wx_block[:,2:-1] -= np.eye(nlayer-1)
-        Wx=np.block([
-        [Wx_block, np.zeros((nlayer-1, nlayer_sum*3))], # Resistivity
-        [np.zeros((nlayer-1, nlayer_sum*1)), Wx_block, np.zeros((nlayer-1, nlayer_sum*2))], # Chargeability
-        [np.zeros((nlayer-1, nlayer_sum*2)), Wx_block, np.zeros((nlayer-1, nlayer_sum*1))], # Time constant
-        [np.zeros((nlayer-1, nlayer_sum*3)), Wx_block], # Exponent C
-        ])
-        self.Wx = Wx
-        return Wx
+        m_fix = np.r_[np.log(res_sea),np.zeros(nlayer), # resistivity
+                     eta_sea, np.zeros(nlayer-1), eta_base, # chargeability
+                     np.log(tau_sea), np.zeros(nlayer-1), np.log(tau_base),# time constant
+                     c_sea, np.zeros(nlayer-1), c_base,# exponent C
+                     np.log(self.tx_height)*np.ones(nlayer_sum-1)
+                     ]
+        self.nlayer_fix = nlayer_fix
+        self.Prj_m = Prj_m
+        self.m_fix = m_fix
+        self.nP= Prj_m.shape[0]
+        self.nM= Prj_m.shape[1]
+        self.nM_r, self.nM_m, self.nM_t, self.nM_c, self.nM_d = nlayer, nlayer-1, nlayer-1, nlayer-1, nlayer-1
+        self.res_sea = res_sea
+        self.eta_sea = eta_sea
+        self.tau_sea = tau_sea
+        self.c_sea = c_sea
 
     def fix_sea_one_tau_c(self,
              res_sea, chg_sea, tau_sea, c_sea):
@@ -387,58 +415,6 @@ class empymod_IPinv:
         assert self.nM == 2*nlayer + 2
         return Prj_m, m_fix
 
-    def get_Wx_rm(self):
-        nlayer = self.nlayer
-        nM_r = self.nM_r
-        nM_m = self.nM_m
-        nM_t = self.nM_t
-        nM_c = self.nM_c
-        depth = self.model_base["depth"]
-        depth= np.r_[depth,2*depth[-1]-depth[-2]]
-        x = (depth[:-1] + depth[1:]) / 2
-
-
-        if nlayer == 1:
-            print("No smoothness for one layer model")
-            nM = self.nM
-            nP = self.nP
-            Wx = np.zeros((nM,nP))
-            self.Wx = Wx
-            return Wx
-        delta_x = np.diff(x)
-        elm1 = 1/delta_x
-        elm2 = np.sqrt(delta_x)
-        Wx_block = np.zeros((nlayer-1, nlayer))
-        Wx_block[:,:-1] = -np.diag(elm2*elm1)
-        Wx_block[:,1:] += np.diag(elm2*elm1)
-        Wx=np.block([
-        [Wx_block, np.zeros((nM_r-1, nM_m + nM_t + nM_c ))], # Resistivity
-        [np.zeros((nM_m-1, nM_r)), Wx_block, np.zeros((nM_m-1,  nM_t + nM_c ))], # Chargeability
-        ])
-        self.Wx = Wx
-        return Wx
-    
-    def get_Ws_sea_one_tau_c(self):
-        nlayer = self.nlayer
-        nM_r = self.nM_r
-        nM_m = self.nM_m
-        nM_t = self.nM_t
-        nM_c = self.nM_c
-        depth = self.model_base["depth"]
-        depth= np.r_[depth,2*depth[-1]-depth[-2]]
-        delta_x = np.diff(depth)
-        elm1 =  np.sqrt(delta_x)
-        Ws_block1 = np.diag(elm1)
-        Ws_block2=  np.r_[elm1.sum()]
-        Ws = np.block([
-            [Ws_block1, np.zeros((nlayer, nM_m)),np.zeros((nlayer,nM_t+nM_c))], # Resistivity
-            [np.zeros((nlayer, nM_r)), Ws_block1,np.zeros((nlayer,nM_t+nM_c))], # Chargeabillity
-            [np.zeros((1, nM_r+nM_m)), Ws_block2,np.zeros((1,nM_c))], # time_constant
-            [np.zeros((1, nM_r+nM_m+nM_t)), Ws_block2], # time_constant
-        ])
-        self.Ws = Ws
-        return Ws
-
     def fix_sea(self, res_sea, chg_sea, tau_sea, c_sea):
         ## return and set mapping for fixigin sea and basement resistivity
         ## Assert there are no fix ing at this stage
@@ -475,37 +451,6 @@ class empymod_IPinv:
         assert self.nM == 4*nlayer
         return Prj_m, m_fix
 
-    def get_Wx_sea(self):
-        nlayer = self.nlayer
-        nlayer_fix=1
-        nlayer_sum = nlayer+nlayer_fix
-        depth = self.model_base["depth"]
-        depth= np.r_[depth,2*depth[-1]-depth[-2]]
-        if nlayer == 1:
-            nM = self.nM
-            nP = self.nP
-            Wx = np.zeros((nM,nP))
-            print("No smoothness for one layer model")
-            self.Wx = Wx
-            return Wx
-        Wx_block = np.zeros((nlayer-1, nlayer_sum))
-        delta_x = np.diff(depth)
-        elm1 = 1/delta_x[:-1]
-        Wx_block[:,1:-1] = -np.diag(elm1)
-        Wx_block[:,2:] += np.diag(elm1)
-        elm2 = np.r_[0,np.sqrt(delta_x)]
-        Wx_block = Wx_block@ np.diag(elm2)
-        # Wx_block[:,1:-1] = np.eye(nlayer-1)
-        # Wx_block[:,2:] -= np.eye(nlayer-1)
-        Wx=np.block([
-        [Wx_block, np.zeros((nlayer-1, nlayer_sum*3))], # Resistivity
-        [np.zeros((nlayer-1, nlayer_sum*1)), Wx_block, np.zeros((nlayer-1, nlayer_sum*2))], # Chargeability
-        [np.zeros((nlayer-1, nlayer_sum*2)), Wx_block, np.zeros((nlayer-1, nlayer_sum*1))], # Time constant
-        [np.zeros((nlayer-1, nlayer_sum*3)), Wx_block], # Exponent C
-        ])
-        self.Wx = Wx
-        return Wx
-
     def noIP(self):
         ## return and set mapping for fixigin sea and basement resistivity
         ## Assert there are no fix ing at this stage
@@ -540,30 +485,6 @@ class empymod_IPinv:
         assert self.nM == nlayer
         return Prj_m, m_fix
 
-    def get_Wx_r(self):
-        nlayer = self.nlayer
-        if nlayer == 1:
-            print("No smoothness for one layer model")
-            nM = self.nM
-            nP = self.nP
-            Wx = np.zeros((nM,nM))
-            self.Wx = Wx
-            return Wx
-        depth = self.model_base["depth"]
-        depth= np.r_[depth,2*depth[-1]-depth[-2]]
-        x = (depth[:-1] + depth[1:]) / 2
-        delta_x = np.diff(x)
-        elm1 = 1/delta_x
-        elm2 = np.sqrt(delta_x)
-        Wx_block = np.zeros((nlayer-1, nlayer))
-        Wx_block[:,:-1] = -np.diag(elm2*elm1)
-        Wx_block[:,1:] += np.diag(elm2*elm1)
-        Wx=np.block([
-        [Wx_block], # Resistivity
-        ])
-        self.Wx = Wx
-        return Wx
-
     def pelton_et_al(self, inp, p_dict):
         """ Pelton et al. (1978)."""
 
@@ -578,27 +499,31 @@ class empymod_IPinv:
         return etaH, etaV
 
     def get_ip_model(self, mvec):
-        Prj_m = self.Prj_m
-        m_fix = self.m_fix
         nlayer= self.nlayer
         nlayer_fix = self.nlayer_fix
         nlayer_sum = nlayer + nlayer_fix
+        Prj_m = self.Prj_m
+        m_fix = self.m_fix
         param = Prj_m @ mvec + m_fix
         res = np.exp(param[            :   nlayer_sum])
         m   =        param[  nlayer_sum: 2*nlayer_sum]
         tau = np.exp(param[2*nlayer_sum: 3*nlayer_sum])
         c   =        param[3*nlayer_sum: 4*nlayer_sum]
-        pelton_model = {'res': res, 'rho_0': res, 'm': m,
-                        'tau': tau, 'c': c, 'func_eta': self.pelton_et_al}
-        return pelton_model
-
+        if self.m_depth:
+            self.model_base['depth'] = np.exp(param[4*nlayer_sum:])
+        res = {'res': res, 'rho_0': res, 'm': m,
+                'tau': tau, 'c': c, 'func_eta': self.pelton_et_al}
+        return res
+    
+    def dpred(self,m):
+        return self.predicted_data(m)
 
     def predicted_data(self, model_vector):
         cut_off = self.cut_off
         filt_curr = self.filt_curr
         window_mat = self.window_mat
-        ip_model = self.get_ip_model(model_vector)
-        data = empymod.bipole(res=ip_model, **self.model_base)
+        res= self.get_ip_model(model_vector)
+        data = empymod.bipole(res=res, **self.model_base)
         if data.ndim == 3:
             # Sum over transmitter and receiver dimensions (axis 1 and axis 2)
             data=np.sum(data, axis=(1, 2))
@@ -640,6 +565,9 @@ class empymod_IPinv:
         if np.isscalar(x):
             return float(projected_x)
         return projected_x
+    
+    def project_convex_set(self, m):
+        return self.clip_model(m)
 
     def proj_c(self,mvec):
         "Project model vector to convex set defined by bound information"
@@ -675,9 +603,10 @@ class empymod_IPinv:
         mvec_tmp[        : index_r]=np.clip(
             mvec[        : index_r], np.log(self.resmin), np.log(self.resmax)
             )
-        mvec_tmp[ index_r: index_m]=np.clip(
-            mvec[ index_r: index_m], self.chgmin, self.chgmax
-            )
+        if self.nM_m > 0:
+            mvec_tmp[ index_r: index_m]=np.clip(
+                mvec[ index_r: index_m], self.chgmin, self.chgmax
+                )
         if self.nM_t > 0:
             mvec_tmp[ index_m: index_t]=np.clip(
                 mvec[ index_m: index_t], np.log(self.taumin), np.log(self.taumax)
@@ -687,6 +616,9 @@ class empymod_IPinv:
                 mvec[ index_t: index_c], self.cmin, self.cmax
                 )
         return mvec_tmp
+    
+    def J(self, model_vector):
+        return self.Japprox(model_vector)
 
     def Japprox(self, model_vector, perturbation=0.1, min_perturbation=1e-3):
         delta_m = min_perturbation  # np.max([perturbation*m.mean(), min_perturbation])
@@ -706,7 +638,65 @@ class empymod_IPinv:
 
         return np.vstack(J).T
 
+    def plot_model(self, model, depth_min=-1e3,depth_max=1e3, ax=None, **kwargs):
+        """
+        Plot a single model (e.g., resistivity, chargeability) with depth.
+        """
+        if ax is None:
+            fig, ax = plt.subplots(1, 1)
 
+        # Default plotting parameters
+        default_kwargs = {
+            "linestyle": "-",
+            "color": "orange",
+            "linewidth": 1.0,
+            "marker": None,
+            "label": "model",
+        }
+        default_kwargs.update(kwargs)
+        if self.nlayer + self.nlayer_fix == 1:
+            depth = np.r_[depth_min, depth_max ]
+        # Prepare depth and model data for plotting
+        else:
+            depth = np.r_[depth_min + self.model_base["depth"][0], 
+                        self.model_base["depth"],
+                        depth_max + self.model_base["depth"][-1] ]
+        depth_plot = np.vstack([depth, depth]).flatten(order="F")[1:-1]
+ #       depth_plot = np.hstack([depth_plot, depth_plot[-1] * 1.5])  # Extend depth for plot
+        model_plot = np.vstack([model, model]).flatten(order="F")
+
+        # Plot model with depth
+        ax.plot(model_plot, depth_plot, **default_kwargs)
+        return ax
+    
+    def plot_IP_par(self, mvec, ax=None, label=None, **kwargs):
+        """
+        Plot all IP parameters (resistivity, chargeability, time constant, exponent c).
+        """
+        if ax is None:
+            fig, ax = plt.subplots(2, 2, figsize=(12, 8))  # Create 2x2 grid of subplots
+        else:
+            ax = np.array(ax)  # Convert ax to a NumPy array if it's not already
+            ax = ax.flatten()  # Ensure ax is a flat array
+
+
+        # Convert model vector to parameters
+        model = self.get_ip_model(mvec)
+
+        # Plot each model parameter
+        self.plot_model(model["res"], ax=ax[0], label=label, **kwargs)
+        ax[0].set_title("Resistivity (ohm-m)")
+
+        self.plot_model(model["m"], ax=ax[1], label=label, **kwargs)
+        ax[1].set_title("Chargeability")
+
+        self.plot_model(model["tau"], ax=ax[2], label=label, **kwargs)
+        ax[2].set_title("Time Constant (sec)")
+
+        self.plot_model(model["c"], ax=ax[3], label=label, **kwargs)
+        ax[3].set_title("Exponent C")
+        return ax
+    
     def get_Wd(self, dobs, ratio=0.10, plateau=0):
         std = np.sqrt(plateau**2 + (ratio*np.abs(dobs))**2) 
         Wd = np.diag(1 / std)
@@ -748,35 +738,7 @@ class empymod_IPinv:
         self.Ws = Ws
         return Ws
 
-    def get_Wx(self):
-        nlayer = self.nlayer
-        depth = self.model_base["depth"]
-        depth= np.r_[depth,2*depth[-1]-depth[-2]]
-        if nlayer == 1:
-            nM = self.nM
-            nP = self.nP
-            Wx = np.zeros((nM,nP))
-            print("No smoothness for one layer model")
-            self.Wx = Wx
-            return Wx
-        Wx_block = np.zeros((nlayer-1, nlayer))
-        delta_x = np.diff(depth)
-        elm1 = 1/delta_x[:-1]
-        Wx_block[:,:-1] = -np.diag(elm1)
-        Wx_block[:,1:] += np.diag(elm1)
-        elm2 = np.sqrt(delta_x)
-        Wx_block = Wx_block @ np.diag(elm2)
-        # Wx_block = np.zeros((nlayer-1, nlayer))
-        # Wx_block[:,1:-1] = np.eye(nlayer-1)
-        # Wx_block[:,2:] -= np.eye(nlayer-1)
-        Wx=np.block([
-        [Wx_block, np.zeros((nlayer-1, nlayer*3))], # Resistivity
-        [np.zeros((nlayer-1, nlayer*1)), Wx_block, np.zeros((nlayer-1, nlayer*2))], # Chargeability
-        [np.zeros((nlayer-1, nlayer*2)), Wx_block, np.zeros((nlayer-1, nlayer*1))], # Time constant
-        [np.zeros((nlayer-1, nlayer*3)), Wx_block], # Exponent C
-        ])
-        self.Wx = Wx
-        return Wx
+ 
 
     def BetaEstimate_byEig(self,mvec, beta0_ratio, eig_tol=1e-12, update_Wsen=True):
         alphax=self.alphax
@@ -810,115 +772,6 @@ class empymod_IPinv:
         lambda_d = np.max(eig_data)
         lambda_r = np.min(eig_reg)
         return beta0_ratio * lambda_d / lambda_r
-
-    def steepest_descent(self, dobs, model_init, niter):
-        '''
-        Eldad Haber, EOSC555, 2023, UBC-EOAS 
-        '''
-        model_vector = model_init
-        r = dobs - self.predicted_data(model_vector)
-        f = 0.5 * np.dot(r, r)
-
-        error = np.zeros(niter + 1)
-        error[0] = f
-        model_itr = np.zeros((niter + 1, model_vector.shape[0]))
-        model_itr[0, :] = model_vector
-
-        print(f'Steepest Descent \n initial phid= {f:.3e} ')
-        for i in range(niter):
-            J = self.Japprox(model_vector)
-            r = dobs - self.predicted_data(model_vector)
-            dm = J.T @ r
-            g = np.dot(J.T, r)
-            Ag = J @ g
-            alpha = np.mean(Ag * r) / np.mean(Ag * Ag)
-            model_vector = self.constrain_model_vector(model_vector + alpha * dm)
-            r = self.predicted_data(model_vector) - dobs
-            f = 0.5 * np.dot(r, r)
-            if np.linalg.norm(dm) < 1e-12:
-                break
-            error[i + 1] = f
-            model_itr[i + 1, :] = model_vector
-            print(f' i= {i:3d}, phid= {f:.3e} ')
-        return model_vector, error, model_itr
-
-
-    def Gradient_Descent(self, dobs, mvec_init, niter, beta, alphas, alphax,
-            s0=1, sfac=0.5, stol=1e-6, gtol=1e-3, mu=1e-4, ELS=True, BLS=True ):
-        Wd = self.Wd
-        Ws = self.Ws
-        Wx = self.Wx
-        mvec_old = mvec_init
-        mvec_new = None
-        mref = mvec_init
-        error_prg = np.zeros(niter + 1)
-        mvec_prg = np.zeros((niter + 1, mvec_init.shape[0]))
-        rd = Wd @ (self.predicted_data(mvec_old) - dobs)
-        phid = 0.5 * np.dot(rd, rd)
-        rms = 0.5 * np.dot(Ws@(mvec_old - mref), Ws@(mvec_old - mref))
-        rmx = 0.5 * np.dot(Wx @ mvec_old, Wx @ mvec_old)
-        phim = alphas * rms + alphax * rmx
-        f_old = phid + beta * phim
-        k = 0
-        error_prg[0] = f_old
-        mvec_prg[0, :] = mvec_old
-        print(f'Gradient Descent \n Initial phid = {phid:.2e} ,phim = {phim:.2e}, error= {f_old:.2e} ')
-        for i in range(niter):
-            # Calculate J:Jacobian and g:gradient
-            J = self.Japprox(mvec_old)
-            g = J.T @ Wd.T @ rd + beta * (alphas * Ws.T @ Ws @ (mvec_old - mref)
-                                          + alphax * Wx.T @ Wx @ mvec_old)
-
-            # Exact line search
-            if ELS:
-                t = np.dot(g,g)/np.dot(Wd@J@g,Wd@J@g)
-#                t = (g.T@g)/(g.T@J.T@J@g)
-            else:
-                t = 1.
-
-            # End inversion if gradient is smaller than tolerance
-            g_norm = np.linalg.norm(g, ord=2)
-            if g_norm < gtol:
-                print(f"Inversion complete since norm of gradient is small as :{g_norm :.3e} ")
-                break
-
-            # Line search method Armijo using directional derivative
-            s = s0
-            dm = t*g
-            directional_derivative = np.dot(g, -dm)
-
-            mvec_new = self.proj_c(mvec_old - s * dm)
-            rd = Wd @ (self.predicted_data(mvec_new) - dobs)
-            phid = 0.5 * np.dot(rd, rd)
-            rms = 0.5 * np.dot(Ws @ (mvec_new - mref), Ws @ (mvec_new - mref))
-#            rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
-            rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
-            phim = alphas * rms + alphax * rmx
-            f_new = phid + beta * phim
-            if BLS:
-                while f_new >= f_old + s * mu * directional_derivative:
-                    s *= sfac
-                    mvec_new = self.proj_c(mvec_old - s * dm)
-                    rd = Wd @ (self.predicted_data(mvec_new) - dobs)
-                    phid = 0.5 * np.dot(rd, rd)
-                    rms = 0.5 * np.dot(Ws @ (mvec_new - mref), Ws @ (mvec_new - mref))
-                    rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
-                    phim = alphas * rms + alphax * rmx
-                    f_new = phid + beta * phim
-                    if np.linalg.norm(s) < stol:
-                        break
-            mvec_old = mvec_new
-            mvec_prg[i + 1, :] = mvec_new
-            f_old = f_new
-            error_prg[i + 1] = f_new
-            k = i + 1
-            print(f'{k:3}, s:{s:.2e}, gradient:{g_norm:.2e}, phid:{phid:.2e}, phim:{phim:.2e}, f:{f_new:.2e} ')
-        # filter model prog data
-        mvec_prg = mvec_prg[:k]
-        error_prg = error_prg[:k]
-        # Save Jacobian
-        self.Jacobian = J
-        return mvec_new, error_prg, mvec_prg
 
     def GaussNewton_smooth(self, dobs, mvec_init, niter,
          beta0, coolingFactor=1.0, coolingRate=3, update_Wsen=True,
@@ -1029,83 +882,6 @@ class empymod_IPinv:
         betas = betas[:k+1]
         return mvec_new, mvec_prg, betas
 
-    def objec_func(self,mvec,dobs,beta):
-        Wd = self.Wd
-        Ws = self.Ws
-        Wx = self.Wx
-        alphas = self.alphas
-        alphax = self.alphax
-        m_ref = self.m_ref
-        Prj_m = self.Prj_m
-        m_fix = self.m_fix
-        rd = Wd @ (self.predicted_data(mvec) - dobs)
-        phid = 0.5 * np.dot(rd, rd)
-        rms =  0.5 * np.linalg.norm(Ws @ (mvec - m_ref))**2
-        rmx = 0.5 * np.dot(Wx @ mvec, Wx @ mvec)
-        # rmx = 0.5 * np.linalg.norm(Wx @ (m_fix+ Prj_m@mvec))**2
-        phim = alphas * rms + alphax * rmx
-        f_obj = phid + beta * phim
-        return f_obj, phid, phim
-
-    def plot_model(self, model, depth_min=-1e3,depth_max=1e3, ax=None, **kwargs):
-        """
-        Plot a single model (e.g., resistivity, chargeability) with depth.
-        """
-        if ax is None:
-            fig, ax = plt.subplots(1, 1)
-
-        # Default plotting parameters
-        default_kwargs = {
-            "linestyle": "-",
-            "color": "orange",
-            "linewidth": 1.0,
-            "marker": None,
-            "label": "model",
-        }
-        default_kwargs.update(kwargs)
-        nlayer = self.nlayer
-        if nlayer == 1:
-            depth = np.r_[depth_min, depth_max ]
-        # Prepare depth and model data for plotting
-        else:
-            depth = np.r_[depth_min + self.model_base["depth"][0], 
-                        self.model_base["depth"],
-                        depth_max + self.model_base["depth"][-1] ]
-        depth_plot = np.vstack([depth, depth]).flatten(order="F")[1:-1]
- #       depth_plot = np.hstack([depth_plot, depth_plot[-1] * 1.5])  # Extend depth for plot
-        model_plot = np.vstack([model, model]).flatten(order="F")
-
-        # Plot model with depth
-        ax.plot(model_plot, depth_plot, **default_kwargs)
-        return ax
-    
-    def plot_IP_par(self, mvec, ax=None, label=None, **kwargs):
-        """
-        Plot all IP parameters (resistivity, chargeability, time constant, exponent c).
-        """
-        if ax is None:
-            fig, ax = plt.subplots(2, 2, figsize=(12, 8))  # Create 2x2 grid of subplots
-        else:
-            ax = np.array(ax)  # Convert ax to a NumPy array if it's not already
-            ax = ax.flatten()  # Ensure ax is a flat array
-
-
-        # Convert model vector to parameters
-        model = self.get_ip_model(mvec)
-
-        # Plot each model parameter
-        self.plot_model(model["res"], ax=ax[0], label=label, **kwargs)
-        ax[0].set_title("Resistivity (ohm-m)")
-
-        self.plot_model(model["m"], ax=ax[1], label=label, **kwargs)
-        ax[1].set_title("Chargeability")
-
-        self.plot_model(model["tau"], ax=ax[2], label=label, **kwargs)
-        ax[2].set_title("Time Constant (sec)")
-
-        self.plot_model(model["c"], ax=ax[3], label=label, **kwargs)
-        ax[3].set_title("Exponent C")
-        return ax
 
 class Pelton_res_f(): 
     def __init__(self, freq=None, 
@@ -1504,20 +1280,6 @@ class debye_con_t():
         mvec_tmp[3]   = np.clip(mvec[3]  ,   self.clim.min(), self.clim.max())
         return mvec_tmp
 
-
-
-class BaseSimulation:
-    @abstractmethod
-    def dpred(self,m):
-        pass
-    @abstractmethod
-    def J(self,m):
-        pass
-    @abstractmethod
-    def project_convex_set(self,m):
-        pass
-
-
 class InducedPolarizationSimulation(BaseSimulation):
     def __init__(self, ip_model=None, window_mat=None,
                  ):
@@ -1561,6 +1323,7 @@ class Optimization:  # Inherits from BaseSimulation
         self.Wx = Wx
         self.alphas = alphas
         self.alphax = alphax
+
     
     def dpred(self, m):
         return self.sim.dpred(m)  # Calls InducedPolarization's dpred()
@@ -1578,7 +1341,10 @@ class Optimization:  # Inherits from BaseSimulation
         self.Wd =np.diag(1 / std.flatten())
         return self.Wd
     
-    def get_Ws(self, mvec):
+    def get_Ws(self, mvec=None):
+        # if self.sim.nM is not None:
+        #     self.Ws = np.eye(self.sim.nM)
+        # else:
         self.Ws = np.eye(mvec.shape[0])
         return self.Ws
 
@@ -1588,42 +1354,165 @@ class Optimization:  # Inherits from BaseSimulation
         Wx[:,3:] += np.diag(np.ones(len(mvec)-3))
         self.Wx = Wx
         return Wx
+    
+    def get_Wx(self):
+        nlayer = self.sim.nlayer
+        depth = self.sim.model_base["depth"]
+        depth= np.r_[depth,2*depth[-1]-depth[-2]]
+        if nlayer == 1:
+            nM = self.nM
+            nP = self.nP
+            Wx = np.zeros((nM,nP))
+            print("No smoothness for one layer model")
+            self.Wx = Wx
+            return Wx
+        Wx_block = np.zeros((nlayer-1, nlayer))
+        delta_x = np.diff(depth)
+        elm1 = 1/delta_x[:-1]
+        Wx_block[:,:-1] = -np.diag(elm1)
+        Wx_block[:,1:] += np.diag(elm1)
+        elm2 = np.sqrt(delta_x)
+        Wx_block = Wx_block @ np.diag(elm2)
+        # Wx_block = np.zeros((nlayer-1, nlayer))
+        # Wx_block[:,1:-1] = np.eye(nlayer-1)
+        # Wx_block[:,2:] -= np.eye(nlayer-1)
+        Wx=np.block([
+        [Wx_block, np.zeros((nlayer-1, nlayer*3))], # Resistivity
+        [np.zeros((nlayer-1, nlayer*1)), Wx_block, np.zeros((nlayer-1, nlayer*2))], # Chargeability
+        [np.zeros((nlayer-1, nlayer*2)), Wx_block, np.zeros((nlayer-1, nlayer*1))], # Time constant
+        [np.zeros((nlayer-1, nlayer*3)), Wx_block], # Exponent C
+        ])
+        self.Wx = Wx
+        return Wx
 
-    def loss_func(self,m, m_ref=None):
+    def get_Wx_sea_basement(self):
+        nlayer = self.sim.nlayer
+        nlayer_fix=2
+        nlayer_sum = nlayer+nlayer_fix
+        nM = self.sim.nM
+        nP = self.sim.nP
+        Wx = np.zeros((nM,nP))
+        if nlayer == 1:
+            print("No smoothness for one layer model")
+            self.Wx = Wx
+            return Wx
+        Wx_block = np.zeros((nlayer-1, nlayer_sum))
+        Wx_block[:,1:-2] = np.eye(nlayer-1)
+        Wx_block[:,2:-1] -= np.eye(nlayer-1)
+        Wx=np.block([
+        [Wx_block, np.zeros((nlayer-1, nlayer_sum*3))], # Resistivity
+        [np.zeros((nlayer-1, nlayer_sum*1)), Wx_block, np.zeros((nlayer-1, nlayer_sum*2))], # Chargeability
+        [np.zeros((nlayer-1, nlayer_sum*2)), Wx_block, np.zeros((nlayer-1, nlayer_sum*1))], # Time constant
+        [np.zeros((nlayer-1, nlayer_sum*3)), Wx_block], # Exponent C
+        ])
+        self.Wx = Wx
+        return Wx
+
+    def get_Wx_r(self):
+        nlayer = self.sim.nlayer
+        if nlayer == 1:
+            print("No smoothness for one layer model")
+            nM = self.nM
+            nP = self.nP
+            Wx = np.zeros((nM,nM))
+            self.Wx = Wx
+            return Wx
+        depth = self.sim.model_base["depth"]
+        depth= np.r_[depth,2*depth[-1]-depth[-2]]
+        x = (depth[:-1] + depth[1:]) / 2
+        delta_x = np.diff(x)
+        elm1 = 1/delta_x
+        elm2 = np.sqrt(delta_x)
+        Wx_block = np.zeros((nlayer-1, nlayer))
+        Wx_block[:,:-1] = -np.diag(elm2*elm1)
+        Wx_block[:,1:] += np.diag(elm2*elm1)
+        Wx=np.block([
+        [Wx_block], # Resistivity
+        ])
+        self.Wx = Wx
+        return Wx
+
+    def get_Wx_rm(self):
+        nlayer = self.sim.nlayer
+        nM_r = self.sim.nM_r
+        nM_m = self.sim.nM_m
+        nM_t = self.sim.nM_t
+        nM_c = self.sim.nM_c
+        depth = self.sim.model_base["depth"]
+        depth= np.r_[depth,2*depth[-1]-depth[-2]]
+        x = (depth[:-1] + depth[1:]) / 2
+
+        if nlayer == 1:
+            print("No smoothness for one layer model")
+            nM = self.sim.nM
+            nP = self.sim.nP
+            Wx = np.zeros((nM,nP))
+            self.Wx = Wx
+            return Wx
+        delta_x = np.diff(x)
+        elm1 = 1/delta_x
+        elm2 = np.sqrt(delta_x)
+        Wx_block = np.zeros((nlayer-1, nlayer))
+        Wx_block[:,:-1] = -np.diag(elm2*elm1)
+        Wx_block[:,1:] += np.diag(elm2*elm1)
+        Wx=np.block([
+        [Wx_block, np.zeros((nM_r-1, nM_m + nM_t + nM_c ))], # Resistivity
+        [np.zeros((nM_m-1, nM_r)), Wx_block, np.zeros((nM_m-1,  nM_t + nM_c ))], # Chargeability
+        ])
+        self.Wx = Wx
+        return Wx
+    
+    def get_Ws_sea_one_tau_c(self):
+        nlayer = self.sim.nlayer
+        nM_r = self.sim.nM_r
+        nM_m = self.sim.nM_m
+        nM_t = self.sim.nM_t
+        nM_c = self.sim.nM_c
+        depth = self.sim.model_base["depth"]
+        depth= np.r_[depth,2*depth[-1]-depth[-2]]
+        delta_x = np.diff(depth)
+        elm1 =  np.sqrt(delta_x)
+        Ws_block1 = np.diag(elm1)
+        Ws_block2=  np.r_[elm1.sum()]
+        Ws = np.block([
+            [Ws_block1, np.zeros((nlayer, nM_m)),np.zeros((nlayer,nM_t+nM_c))], # Resistivity
+            [np.zeros((nlayer, nM_r)), Ws_block1,np.zeros((nlayer,nM_t+nM_c))], # Chargeabillity
+            [np.zeros((1, nM_r+nM_m)), Ws_block2,np.zeros((1,nM_c))], # time_constant
+            [np.zeros((1, nM_r+nM_m+nM_t)), Ws_block2], # time_constant
+        ])
+        self.Ws = Ws
+        return Ws    
+
+    def loss_func(self,m, beta, m_ref=None):
         r = self.dpred(m)-self.dobs
         r = self.Wd @ r
         phid = 0.5 * np.dot(r,r)
         phim = 0
         if m_ref is not None:
             rms = self.Ws @ (m - m_ref)
-            phim += 0.5 * np.dot(rms, rms)
+            phim += 0.5 * self.alphas*np.dot(rms, rms)
         if self.Wx is not None:
             rmx = self.Wx @ m
-            phim += 0.5 * np.dot(rmx, rmx)
-        return phid + phim
+            phim += 0.5 * self.alphax*np.dot(rmx, rmx)
+        return phid+beta*phim, phid, phim
     
     def BetaEstimate_byEig(self,mvec, beta0_ratio=1.0, eig_tol=eps, update_Wsen=False):
-        alphax=self.alphax
-        alphas=self.alphas
-        Wd = self.Wd
-        Wx = self.Wx
-        Ws= self.Ws
         J = self.J(mvec)
 
         if update_Wsen:
             self.update_Ws(J)            
 
         # Effective data misfit term with projection matrix
-        A_data =  J.T @ Wd.T @ Wd @ J 
+        A_data =  J.T @ self.Wd.T @ self.Wd @ J 
         eig_data = np.linalg.eigvalsh(A_data)
         
         # Effective regularization term with projection matrix
         # A_reg = alphax* Prj_m.T @ Wx.T @ Wx @ Prj_m
         A_reg = np.zeros_like(A_data)
-        if Wx is not None:
-            A_reg += alphax * Wx.T @ Wx 
-        if Ws is not None:
-            A_reg += alphas * (Ws.T @ Ws)
+        if self.Wx is not None:
+            A_reg += self.alphax * self.Wx.T @ self.Wx 
+        if self.Ws is not None:
+            A_reg += self.alphas * (self.Ws.T @ self.Ws)
         eig_reg = np.linalg.eigvalsh(A_reg)
         
         # Ensure numerical stability (avoid dividing by zero)
@@ -1646,17 +1535,128 @@ class Optimization:  # Inherits from BaseSimulation
         Ws = np.diag(Sensitivity)
         self.Ws = Ws
         return Ws
+    
+    def steepest_descent(self, dobs, model_init, niter):
+        '''
+        Eldad Haber, EOSC555, 2023, UBC-EOAS 
+        '''
+        model_vector = model_init
+        r = dobs - self.predicted_data(model_vector)
+        f = 0.5 * np.dot(r, r)
+
+        error = np.zeros(niter + 1)
+        error[0] = f
+        model_itr = np.zeros((niter + 1, model_vector.shape[0]))
+        model_itr[0, :] = model_vector
+
+        print(f'Steepest Descent \n initial phid= {f:.3e} ')
+        for i in range(niter):
+            J = self.J(model_vector)
+            r = dobs - self.dpred(model_vector)
+            dm = J.T @ r
+            g = np.dot(J.T, r)
+            Ag = J @ g
+            alpha = np.mean(Ag * r) / np.mean(Ag * Ag)
+            model_vector = self.project_convex_set(model_vector + alpha * dm)
+            r = self.dpred(model_vector) - dobs
+            f = 0.5 * np.dot(r, r)
+            if np.linalg.norm(dm) < 1e-12:
+                break
+            error[i + 1] = f
+            model_itr[i + 1, :] = model_vector
+            print(f' i= {i:3d}, phid= {f:.3e} ')
+        return model_vector, error, model_itr
+
+    def Gradient_Descent(self, dobs, mvec_init, niter, beta, alphas, alphax,
+            s0=1, sfac=0.5, stol=1e-6, gtol=1e-3, mu=1e-4, ELS=True, BLS=True ):
+        Wd = self.Wd
+        Ws = self.Ws
+        Wx = self.Wx
+        mvec_old = mvec_init
+        mvec_new = None
+        mref = mvec_init
+        error_prg = np.zeros(niter + 1)
+        mvec_prg = np.zeros((niter + 1, mvec_init.shape[0]))
+        rd = Wd @ (self.dpred(mvec_old) - dobs)
+        phid = 0.5 * np.dot(rd, rd)
+        rms = 0.5 * np.dot(Ws@(mvec_old - mref), Ws@(mvec_old - mref))
+        rmx = 0.5 * np.dot(Wx @ mvec_old, Wx @ mvec_old)
+        phim = alphas * rms + alphax * rmx
+        f_old = phid + beta * phim
+        k = 0
+        error_prg[0] = f_old
+        mvec_prg[0, :] = mvec_old
+        print(f'Gradient Descent \n Initial phid = {phid:.2e} ,phim = {phim:.2e}, error= {f_old:.2e} ')
+        for i in range(niter):
+            # Calculate J:Jacobian and g:gradient
+            J = self.J(mvec_old)
+            g = J.T @ Wd.T @ rd + beta * (alphas * Ws.T @ Ws @ (mvec_old - mref)
+                                          + alphax * Wx.T @ Wx @ mvec_old)
+
+            # Exact line search
+            if ELS:
+                t = np.dot(g,g)/np.dot(Wd@J@g,Wd@J@g)
+#                t = (g.T@g)/(g.T@J.T@J@g)
+            else:
+                t = 1.
+
+            # End inversion if gradient is smaller than tolerance
+            g_norm = np.linalg.norm(g, ord=2)
+            if g_norm < gtol:
+                print(f"Inversion complete since norm of gradient is small as :{g_norm :.3e} ")
+                break
+
+            # Line search method Armijo using directional derivative
+            s = s0
+            dm = t*g
+            directional_derivative = np.dot(g, -dm)
+
+            mvec_new = self.project_convex_set(mvec_old - s * dm)
+            rd = Wd @ (self.dpred(mvec_new) - dobs)
+            phid = 0.5 * np.dot(rd, rd)
+            rms = 0.5 * np.dot(Ws @ (mvec_new - mref), Ws @ (mvec_new - mref))
+#            rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
+            rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
+            phim = alphas * rms + alphax * rmx
+            f_new = phid + beta * phim
+            if BLS:
+                while f_new >= f_old + s * mu * directional_derivative:
+                    s *= sfac
+                    mvec_new = self.project_convex_set(mvec_old - s * dm)
+                    rd = Wd @ (self.dpred(mvec_new) - dobs)
+                    phid = 0.5 * np.dot(rd, rd)
+                    rms = 0.5 * np.dot(Ws @ (mvec_new - mref), Ws @ (mvec_new - mref))
+                    rmx = 0.5 * np.dot(Wx @ mvec_new, Wx @ mvec_new)
+                    phim = alphas * rms + alphax * rmx
+                    f_new = phid + beta * phim
+                    if np.linalg.norm(s) < stol:
+                        break
+            mvec_old = mvec_new
+            mvec_prg[i + 1, :] = mvec_new
+            f_old = f_new
+            error_prg[i + 1] = f_new
+            k = i + 1
+            print(f'{k:3}, s:{s:.2e}, gradient:{g_norm:.2e}, phid:{phid:.2e}, phim:{phim:.2e}, f:{f_new:.2e} ')
+        # filter model prog data
+        mvec_prg = mvec_prg[:k]
+        error_prg = error_prg[:k]
+        # Save Jacobian
+        self.Jacobian = J
+        return mvec_new, error_prg, mvec_prg
 
     def GaussNewton(self,mvec_init, niter, beta0, print_update=True, coolingFactor=2.0, coolingRate=2,
         s0=1.0, sfac = 0.5,  stol=1e-6, update_Wsen=False, gtol=1e-3, mu=1e-4):
 
         mvec_old = mvec_init.copy()
         m_ref = mvec_init
-        f_old = self.loss_func(mvec_old, m_ref=m_ref)
-        error_prg = np.zeros(niter + 1)
-        mvec_prg = np.zeros((niter + 1, mvec_init.shape[0]))
-        error_prg[0] = f_old
-        mvec_prg[0, :] = mvec_old
+        self.error_prg = []
+        self.data_prg = []
+        self.mvec_prg = []
+        f_old, phid, phim= self.loss_func(mvec_old, beta0, m_ref=m_ref)
+
+        self.error_prg.append([f_old, phid, phim])
+        self.mvec_prg.append(mvec_old)
+        self.data_prg.append(self.dpred(mvec_old))
 
         for i in range(niter):
             beta = beta0 / (coolingFactor ** (i // coolingRate))
@@ -1683,21 +1683,24 @@ class Optimization:  # Inherits from BaseSimulation
 
             s = s0
             mvec_new = self.project_convex_set(mvec_old - s * dm)
-            f_new = self.loss_func(mvec_new, m_ref=m_ref)# phid
+            f_new, phid, phim = self.loss_func(mvec_new,beta, m_ref=m_ref)# phid
             directional_derivative = np.dot(g.flatten(), -dm.flatten())
             while f_new >= f_old + s * mu * directional_derivative:
                 s *= sfac
                 mvec_new = self.project_convex_set(mvec_old - s * dm)
-                f_new = self.loss_func(mvec_new,m_ref=m_ref) #phid
+                f_new, phid, phim = self.loss_func(mvec_new,beta,m_ref=m_ref) #phid
                 if s < stol:
                     break
             mvec_old = mvec_new
-            mvec_prg[i + 1, :] = mvec_new
             f_old = f_new
-            error_prg[i + 1] = f_new
+            self.error_prg.append([f_new, phid, phim])
+            self.mvec_prg.append(mvec_new)
+            self.data_prg.append(self.dpred(mvec_new))
             if print_update:
-                print(f'{i + 1:3}, beta:{beta:.1e}, step:{s:.1e}, gradient:{g_norm:.1e},  f:{f_new:.1e}')
-        return mvec_new, error_prg, mvec_prg
+                print(f'{i+1:3}, beta:{beta:.1e}, step:{s:.1e}, g:{g_norm:.1e}, phid:{phid:.1e}, phim:{phim:.1e}, f:{f_new:.1e} ')
+
+        return mvec_new
+
 
 class InducedPolarization:
 
