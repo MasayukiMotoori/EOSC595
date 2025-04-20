@@ -21,7 +21,16 @@ from abc import ABC, abstractmethod
 
 class TorchHelper:
     @staticmethod
-    def to_tensor(x, dtype=torch.float32, device='cpu'):
+    def to_tensor_r(x, dtype=torch.float32, device='cpu'):
+        if isinstance(x, torch.Tensor):
+            return x.to(dtype=dtype, device=device)
+        elif isinstance(x, np.ndarray):
+            return torch.from_numpy(x).to(dtype=dtype, device=device)
+        else:
+            return torch.tensor(x, dtype=dtype, device=device)
+
+    @staticmethod
+    def to_tensor_c(x, dtype=torch.complex64, device='cpu'):
         if isinstance(x, torch.Tensor):
             return x.to(dtype=dtype, device=device)
         elif isinstance(x, np.ndarray):
@@ -36,11 +45,11 @@ class Pelton_res_f():
             taulim= [1e-8, 1e4],
             clim= [0.2, 0.8]
                 ):
-        self.freq = torch.tensor(freq, dtype=torch.cfloat)
-        self.reslim = torch.tensor(np.log(reslim))
-        self.chglim = torch.tensor(chglim)
-        self.taulim = torch.tensor(np.log(taulim))
-        self.clim = torch.tensor(clim)
+        self.freq = TorchHelper.to_tensor_c(freq) if freq is not None else None
+        self.reslim = TorchHelper.to_tensor_r(np.log(reslim))
+        self.chglim = TorchHelper.to_tensor_r(chglim)
+        self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
+        self.clim = TorchHelper.to_tensor_r(clim)
 
     def f(self,p):
         """
@@ -70,20 +79,24 @@ class Pelton_res_f():
         return mvec_tmp
 
 class Pelton_debye_f():
-    def __init__(self, freq=None,times=None,ntau=None,taus=None,
+    def __init__(self,
+            freq=None,
+            times=None, tstep=None,
+            ntau=None,taus=None,
             reslim= [1e-2,1e5],
             chglim= [1e-3, 0.9],
             taulim= [1e-5, 1e1],
             taulimspc = [2,10],
                 ):
-        self.times = torch.tensor(times)
-        self.freq = torch.tensor(freq, dtype=torch.cfloat)
-        self.ntau = ntau
-        self.taus = torch.tensor(taus) if taus is not None else None
-        self.reslim = torch.tensor(np.log(reslim))
-        self.chglim = torch.tensor(chglim)
-        self.taulim = torch.tensor(np.log(taulim))
-        self.taulimspc = torch.tensor(np.log(taulimspc))
+        self.times = TorchHelper.to_tensor_r(times) if times is not None else None
+        self.tstep = TorchHelper.to_tensor_r(tstep) if tstep is not None else None
+        self.freq = TorchHelper.to_tensor_c(freq) if freq is not None else None
+        self.ntau = ntau if ntau is not None else None
+        self.taus = TorchHelper.to_tensor_r(taus) if taus is not None else None
+        self.reslim = TorchHelper.to_tensor_r(np.log(reslim))
+        self.chglim = TorchHelper.to_tensor_r(chglim)
+        self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
+        self.taulimspc = TorchHelper.to_tensor_r(np.log(taulimspc))
 
     def f(self, p):
         """
@@ -111,7 +124,7 @@ class Pelton_debye_f():
         term = -iwt * etas / (1 + iwt)  # shape: [nfreq, ntau]
         return rho0 * (1 + term.sum(dim=1))  # shape: [nfreq]
 
-    def t(self, p):
+    def t(self, p, tstep=None):
         """
         Pelton linear weighted Debye model in time domain.
         Parameters:
@@ -121,6 +134,9 @@ class Pelton_debye_f():
         Returns:
             Real value resistivity given times.
         """
+        if tstep is not None:
+            self.tstep = TorchHelper.to_tensor_r(tstep)
+
         rho0 = torch.exp(p[0])
         etas = p[1:1 + self.ntau]
         if self.taus is None:
@@ -137,9 +153,13 @@ class Pelton_debye_f():
         term = etas/taus*torch.exp(-times/taus)  # shape: [ntime, ntau]
         term_sum = term.sum(dim=1)  # shape: [ntime]
         term_sum[ind_0] = 1-etas.sum(dim=1)  # Set the value at t=0 to 1 - sum(etas)
-
-        return rho0 * (term_sum)  # shape: [tau]
-
+        if self.tstep is not None:
+            ind_pos = torch.where(self.times > 0)
+            term_sum[ind_pos] *= self.tstep
+            return rho0 * (term_sum)  # shape: [tau]
+        else:
+            return rho0 * (term_sum)  # shape: [tau]
+ 
     def clip_model(self,mvec):
         # Clone to avoid modifying the original tensor
         mvec_tmp = mvec.clone().detach()
@@ -155,7 +175,7 @@ class Pelton_debye_f():
             mvec_tmp[ind_tau] = torch.clamp(mvec[ind_tau], self.taulim.min(), self.taulim.max())
             mvec_tmp[ind_tau[0]] = torch.clamp(mvec[ind_tau[0]],
                         self.taulim.min()+self.taulimspc.min(), self.taulim.min() + self.taulimspc.max())
-            a_local = torch.tensor(np.r_[-1.0,1.0], dtype=torch.float32)
+            a_local = torch.tensor(np.r_[-1.0,1.0], dtype=torch.float)
             for i in range(self.ntau-1):
                 mvec_tmp[ind_tau[i:i+2]] = self.proj_halfspace(
                     mvec[i:i+2], -a_local, self.taulimspc.max())
@@ -173,7 +193,6 @@ class Pelton_debye_f():
             proj_x = x
         return proj_x
 
-
 class ColeCole_f():
     def __init__(self, freq=None, res=False,
             conlim= [1e-5,1e2],
@@ -181,12 +200,12 @@ class ColeCole_f():
             taulim= [1e-8, 1e4],
             clim= [0.2, 0.8]
                 ):
-        self.freq =  torch.tensor(freq, dtype=torch.cfloat)
+        self.freq =  TorchHelper.to_tensor_c(freq)if freq is not None else None
         self.res = res
-        self.reslim = torch.tensor(np.log(conlim))
-        self.chglim = torch.tensor(chglim)
-        self.taulim = torch.tensor(np.log(taulim))
-        self.clim = torch.tensor(clim)
+        self.reslim = TorchHelper.to_tensor_r(np.log(conlim))
+        self.chglim = TorchHelper.to_tensor_r(chglim)
+        self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
+        self.clim = TorchHelper.to_tensor_r(clim)
 
     def f(self,p):
         """
@@ -219,7 +238,7 @@ class Pelton_res_f_two():
             taulim= [1e-8, 1e4],
             clim= [0.2, 0.8]
                 ):
-        self.freq = freq
+        self.freq = torch.tensor(freq, dtype=torch.cfloat) if freq is not None else None
         self.reslim = torch.tensor(np.log(reslim))
         self.chglim = torch.tensor(chglim)
         self.taulim = torch.tensor(np.log(taulim))
@@ -264,7 +283,7 @@ class Pelton_res_f_dual():
         taulim= [1e-8, 1e4],
         clim= [0.2, 0.8]
             ):
-        self.freq = freq
+        self.freq = torch.tensor(freq, dtype=torch.cfloat) if freq is not None else None
         self.reslim = torch.tensor(np.log(reslim))
         self.chglim = torch.tensor(chglim)
         self.taulim = torch.tensor(np.log(taulim))
@@ -310,7 +329,7 @@ class Pelton_con_f():
         taulim= [1e-8, 1e4],
         clim= [0.2, 0.8]
             ):
-        self.freq =  torch.tensor(freq, dtype=torch.cfloat)
+        self.freq =  torch.tensor(freq, dtype=torch.cfloat) if freq is not None else None
         self.conlim = torch.tensor(np.log(conlim))
         self.chglim = torch.tensor(chglim)
         self.taulim = torch.tensor(np.log(taulim))
@@ -356,24 +375,45 @@ class BaseSimulation:
         pass
 
 class InducedPolarizationSimulation(BaseSimulation):
+    AVAILABLE_MODES = ['tdip_t', 'tdip_f', 'sip_t', 'sip']
+
     eps = torch.finfo(torch.float32).eps
     def __init__(self, 
                  ip_model=None,
-                 t=False,
                  mode=None,
                  times=None,
                  basefreq=None,
-                #  window_mat=None,
-                #  windows_strt=None,
-                #  windows_end=None
+                 window_mat=None,
+                 windows_strt=None,
+                 windows_end=None,
+                 log2min=-6,
+                 log2max=6,
                  ):
+        """
+        Induced Polarization Simulation.
+
+        Parameters:
+        - ip_model: input IP model for simulation
+        - mode (str): One of ['tdip_t', 'tdip_f', 'sip_t', 'sip']
+        - times: Time values (1D list or tensor)
+        - basefreq: Frequency base (1D list or tensor)
+        - window_mat: Matrix used for windowing the response
+        - windows_strt, windows_end: (Optional) Start and end times for windows
+        """
+        #  Validate the mode
+        if mode is not None and mode not in self.AVAILABLE_MODES:
+            raise ValueError(f"Invalid mode '{mode}'. Choose from {self.AVAILABLE_MODES}")
+
         self.ip_model = ip_model
-        self.t = t
-        self.times = torch.tensror(times)
-        self.basefreq = torch.tensror(basefreq)
-        # self.window_mat = window_mat 
-        # self.windows_strt = windows_strt
-        # self.windows_end = windows_end 
+        self.mode=mode
+        self.times = TorchHelper.to_tensor_r(times) if times is not None else None
+        self.basefreq = TorchHelper.to_tensor_r(basefreq) if basefreq is not None else None
+        self.window_mat = TorchHelper.to_tensor_r(window_mat) if window_mat is not None else None 
+        self.windows_strt = TorchHelper.to_tensor_r(windows_strt) if windows_strt is not None else None
+        self.windows_end = TorchHelper.to_tensor_r(windows_end) if windows_end is not None else None
+        self.windows_width = TorchHelper.to_tensor_r(windows_end-windows_strt) if windows_strt is not None else None
+        self.log2min = log2min
+        self.log2max = log2max
    
     def count_data_windows(self, times):
         nwindows = len(self.windows_strt)
@@ -385,29 +425,59 @@ class InducedPolarizationSimulation(BaseSimulation):
             count_data[i] = ind_time.sum()
         return count_data
 
-    def get_freq_windowmat(self,tau,log2min=-8, log2max=8):
+    def get_freq_windowmat(self,tau, max=22):
+        log2max = self.log2max
+        log2min = self.log2min
         freqend = ((1 / tau) * 2 ** log2max).item()
         freqstep = ((1 / tau) * 2 ** log2min).item()
         freq = torch.arange(0, freqend, freqstep)
         times = torch.arange(0, 1/freqstep,1/freqend)
+
         count = self.count_data_windows(times)
-        while count.min() < 2:
-            print(count)
-            log2max += 1
-            freqend = ((1/tau)*2**log2max).item()
-            if log2max > 15:
-                print('Some windows has less than two data')
+        # while count[self.windows_end==self.windows_end.max()] <2:
+        #     # print(count)
+        #     log2min -= 1
+        #     freqstep = ((1/tau)*2**log2min).item()
+        #     if log2max-log2min >= max:
+        #         print('some windows are too narrow')
+        #         break
+        #     freq = torch.arange(0,freqend,freqstep)
+        #     times = torch.arange(0, 1/freqstep,1/freqend)
+        #     count = self.count_data_windows(times)
+
+        while times.max() < self.windows_end.max():
+            # print(count)
+            log2min -= 1
+            freqstep = ((1/tau)*2**log2min).item()
+            if log2max-log2min >= max:
+                print('some windows are too narrow')
                 break
-            if count[self.windows_end==self.windows_end.max()] <2:
-                log2min -= 1
-                freqstep = ((1/tau)*2**log2min).item()
-                if log2min < -15:
-                    print('Some windows has less than two data')
-                    break
             freq = torch.arange(0,freqend,freqstep)
             times = torch.arange(0, 1/freqstep,1/freqend)
+            # freq = torch.fft.fftfreq(len(freq), d=1/freqend)
             count = self.count_data_windows(times)
+        
+        ind_narrow = self.windows_width == self.windows_width.min()
+        if ind_narrow.sum() >= 2:
+            # print(torch.where(ind_narrow)[0])
+            # print(torch.where(ind_narrow)[0][0].item())
+            ind_narrow = torch.where(ind_narrow)[0][0].item()
+
+        while count[ind_narrow] <2:
+            # print(count)
+            log2max += 1
+            freqend = ((1/tau)*2**log2max).item()
+            if log2max-log2min >= max:
+                print('some windows are too narrow')
+                break
+            freq = torch.arange(0,freqend,freqstep)
+            times = torch.arange(0, 1/freqstep,1/freqend)
+            # freq = torch.fft.fftfreq(len(times), d=1/freqend)
+            count = self.count_data_windows(times)
+
         self.times = times
+        # freq = torch.fft.fftfreq(len(freq), d=1/freqend)
+
         self.ip_model.freq = freq
         self.get_window_matrix(times=times)
         
@@ -419,7 +489,6 @@ class InducedPolarizationSimulation(BaseSimulation):
             f_sym[:nfreq2] = f[:nfreq2]
             f_sym[nfreq2] =f[nfreq2].real
             f_sym[nfreq2+1:] = torch.flip(f[1:nfreq2].conj(), dims=[0])
-
         # Ensure symmetry at the Nyquist frequency (if even length)
         else:
             nfreq2 = nfreq // 2 
@@ -433,51 +502,106 @@ class InducedPolarizationSimulation(BaseSimulation):
         return t
 
     def get_windows(self,windows_cen):
-        windows_cen = windows_cen[windows_cen>0]
+        # windows_cen = TorchHelper.to_tensor_r(windows_cen[windows_cen>0])
+        windows_cen = TorchHelper.to_tensor_r(windows_cen)
         windows_strt = torch.zeros_like(windows_cen)
         windows_end  = torch.zeros_like(windows_cen)
         dt = torch.diff(windows_cen)
         windows_strt[1:] = windows_cen[:-1] + dt / 2
         windows_end[:-1] = windows_cen[1:] - dt / 2
-        windows_strt[0] = 10*eps
+        # windows_strt[0] = 10*eps
+        windows_strt[0] = windows_cen[0] - dt[0] / 2
         windows_end[-1] = windows_cen[-1] + dt[-1] / 2
         self.windows_strt = windows_strt
         self.windows_end = windows_end
+        self.windows_width = windows_end - windows_strt
 
-    def get_window_matrix (self,times, sum=False):
+    def get_windows_linlog(self, windows_cen01):
+        logstep = np.log(windows_cen01.max()/windows_cen01.min())/len(windows_cen01)
+
+    def get_window_matrix(self, times=None, sum=False):
+        if times is not None:
+            self.times = TorchHelper.to_tensor_r(times)
         nwindows = len(self.windows_strt)
-        window_matrix = torch.zeros((nwindows+1, len(times)))
-        window_matrix[0,0] = 1
+        window_matrix = torch.zeros((nwindows, len(self.times)))
         for i in range(nwindows):
-            ind_time = (times >= self.windows_strt[i]) & (times <= self.windows_end[i])
-            if ind_time.sum() > 0:
+            ind_time = (self.times >= self.windows_strt[i]) & (self.times <= self.windows_end[i])
+            count = ind_time.sum()
+            if count > 0:
                 if sum:
-                    window_matrix[i+1, ind_time] = torch.ones(ind_time.sum())
-                window_matrix[i+1, ind_time] = 1.0/(ind_time.sum())
+                    window_matrix[i, ind_time] = 1.0
+                else:
+                    window_matrix[i, ind_time] = 1.0 / count
+            else:
+                print(f"Warning: No data points found for window {i+1} ({self.windows_strt[i]} to {self.windows_end[i]})")
         self.window_mat = window_matrix
+        # window_matrix = torch.zeros((nwindows+1, len(self.times)))
+        # window_matrix[0,0] = 1
+        # for i in range(nwindows):
+        #     ind_time = (self.times >= self.windows_strt[i]) & (self.times <= self.windows_end[i])
+        #     if ind_time.sum() > 0:
+        #         if sum:
+        #             window_matrix[i+1, ind_time] = torch.ones(ind_time.sum())
+        #         window_matrix[i+1, ind_time] = 1.0/(ind_time.sum())
+        # self.window_mat = window_matrix
 
+    def set_current_wave(self, basefreq=None, duty=0.5):
+        if basefreq is not None:
+            self.basefreq = basefreq
+        curr =  0.5*(1.0+signal.square(2*np.pi*(self.basefreq*self.times),duty=0.5))
+        self.curr = TorchHelper.to_tensor_r(curr)
+
+    def fft_convolve(self, d, f):
+        """
+        Perform 1D linear convolution using FFT (like scipy.signal.fftconvolve).
+        Assumes x and h are 1D tensors.
+        Returns output of length (len(x) + len(h) - 1)
+        """
+        nd = d.shape[0] 
+        nf = f.shape[0] 
+        # Compute FFTs (real FFT for speed)
+        D = torch.fft.rfft(d, n=nd+nf-1)
+        F = torch.fft.rfft(f, n=nd+nf-1)
+        # Element-wise multiplication
+        DF = D * F
+        # Inverse FFT to get back to time domain
+        return  torch.fft.irfft(DF, n=nd+nf-1)
+ 
     def dpred(self,m):
         if self.mode=="tdip_t" :
             ip_t=self.ip_model.t(m)
-            volt = torch.conv1d(ip_t,self.curr)
-            return self.window_mat@volt
-        
-        elif self.mode=="tdip_f":
-            self.get_freq_windowmat(tau=torch.exp(m[2]))
-            ip_f=self.ip_model.f(m)
-            ip_t = self.compute_fft(ip_f)
-            ip_t = ip_t.real
-            volt = torch.conv1d(ip_t,self.curr)
+            volt = self.fft_convolve(ip_t,self.curr)[: len(self.times)]
             return self.window_mat@volt
 
-        elif self.mode=="sip_t":
+
+        if self.mode=="tdip_f":
+            ip_f = self.ip_model.f(m)
+            ip_t = torch.fft.ifft(ip_f).real
+            volt = self.fft_convolve(ip_t,self.curr)[: len(self.times)]
+            return self.window_mat@volt
+
+        # if self.mode=="tdip_f":
+        #     self.get_freq_windowmat(tau=torch.exp(m[2]))
+        #     self.set_current_wave()
+        #     ip_f = self.ip_model.f(m)
+        #     ip_fsym = self.freq_symmetric(ip_f)
+        #     ip_t = torch.fft.ifft(ip_fsym).real
+        #     volt = self.fft_convolve(ip_t,self.curr)[: len(self.times)]
+        #     return self.window_mat@volt
+            # assert len(self.times) == len(self.ip_model.freq)
+            # curr_f = torch.fft.fft(self.curr)
+            # volt = torch.fft.ifft(ip_fsym*curr_f).real
+            # volt = volt[: len(self.times)]
+            # return self.window_mat@volt
+
+        if self.mode=="sip_t":
             self.get_freq_windowmat(tau=torch.exp(m[2]))
             f = self.ip_model.f(m)
             t = self.compute_fft(f)/(self.times[1]-self.times[0])
             t_real = t.real
             return self.window_mat@t_real
         
-        elif self.mode=="sip":
+        if self.mode=="sip":
             f = self.ip_model.f(m)
             f_real = f.real
             f_imag = f.imag
@@ -485,19 +609,19 @@ class InducedPolarizationSimulation(BaseSimulation):
                 return torch.cat([f_real, f_imag])
             else:
                 return torch.cat([self.window_mat@f_real, self.window_mat@f_imag])
-        
-        print("Simulation mode not available")
-        return None
 
-    def set_current_wave(self, basefreq):
-        self.basefreq = basefreq
-        self.curr=torch.tensor(0.5*(1.0+signal.square(2*np.pi*(self.basefreq*self.times),duty=0.5)))
 
     def J(self,m):
         return torch.autograd.functional.jacobian(self.dpred, m)   
 
+    def Jvec(self, m, v):
+        return torch.autograd.functional.jvp(self.dpred, m, v)
+
+    def Jtvec(self, m, v):
+        return torch.autograd.functional.vjp(self.dpred, m, v)
+
     def project_convex_set(self,m):
-        return self.ip_model.clip_model(m)
+        return self.ip_model.clip_model(m).detach().requires_grad_(False)
 
 class Optimization():  # Inherits from BaseSimulation
     def __init__(self,
@@ -521,38 +645,46 @@ class Optimization():  # Inherits from BaseSimulation
     def J(self, m):
         return self.sim.J(m)  # Calls InducedPolarization's J()
     
+    def Jvec(self, m, v):
+        return self.sim.Jvec(m, v)
+    
+    def Jtvec(self, m, v):
+        return self.sim.Jtvec(m, v)
+    
     def project_convex_set(self,m):
         return self.sim.project_convex_set(m)
 
-    def get_Wd(self,ratio=0.10, plateau=0):
+    def get_Wd(self,ratio=0.10, plateau=0, sparse=False):
         dobs_clone = self.dobs.clone().detach()
         noise_floor = plateau * torch.ones_like(dobs_clone)
         std = torch.sqrt(noise_floor**2 + (ratio * torch.abs(dobs_clone))**2)
         self.Wd =torch.diag(1 / std.flatten())
-        return self.Wd
-    
-    def get_Ws(self, mvec):
+        if sparse:
+            self.Wd = self.Wd.to_sparse()
+
+    def get_Ws(self, mvec, sparse=False):
         self.Ws = torch.eye(mvec.shape[0])
-        return self.Ws
+        if sparse:
+            self.Ws = self.Ws.to_sparse()
     
     def loss_func_L2(self,m, beta, m_ref=None):
         r = self.dpred(m)-self.dobs
         r = self.Wd @ r
-        phid = 0.5 * torch.dot(r,r)
+        phid = 0.5 * torch.sum(r**2)
         phim = 0
 
         if m_ref is not None:
             rms = self.Ws @ (m - m_ref)
-            phim = 0.5 * self.alphas*torch.dot(rms, rms)
+            phim = 0.5 * self.alphas*torch.sum(rms**2)
         if self.Wx is not None:
             rmx = self.Wx @ m
-            phim += 0.5 * self.alphax*torch.dot(rmx, rmx) 
+            phim += 0.5 * self.alphax*torch.sum(rmx**2) 
         return phid+beta*phim, phid, phim 
 
     def loss_func_L1reg(self,m, beta, m_ref=None):
         r = self.dpred(m)-self.dobs
         r = self.Wd @ r
-        phid = 0.5 * torch.dot(r,r)
+        phid = 0.5 * torch.sum(r**2)
         phim = 0
         if m_ref is not None:
             rms = self.Ws @ (m - m_ref)
@@ -562,12 +694,9 @@ class Optimization():  # Inherits from BaseSimulation
             phim += self.alphax*torch.sum(abs(rmx)) 
         return phid+beta*phim, phid, phim 
 
-    def BetaEstimate_byEig(self,mvec, beta0_ratio=1.0, eig_tol=eps, update_Wsen=False):
-        alphax=self.alphax
-        alphas=self.alphas
-        Wd = self.Wd
-        Wx = self.Wx
-        Ws= self.Ws
+    def BetaEstimate_byEig(self,m, beta0_ratio=1.0, 
+                eig_tol=eps,l1reg=False, norm=True,update_Wsen=False):
+        mvec = m.clone().detach()
         J = self.J(mvec)
 
         if update_Wsen:
@@ -576,40 +705,66 @@ class Optimization():  # Inherits from BaseSimulation
         # Prj_m = self.Prj_m  # Use `Proj_m` to map the model space
 
         # Effective data misfit term with projection matrix
-        A_data =  J.T @ Wd.T @ Wd @ J 
-        eig_data = torch.linalg.eigvalsh(A_data)
+        A_data =  J.T @ self.Wd.T @ self.Wd @ J 
         
         # Effective regularization term with projection matrix
         # A_reg = alphax* Prj_m.T @ Wx.T @ Wx @ Prj_m
         A_reg = torch.zeros_like(A_data)
-        if Wx is not None:
-            A_reg += alphax * Wx.T @ Wx 
-        if Ws is not None:
-            A_reg += alphas * (Ws.T @ Ws)
-        eig_reg = torch.linalg.eigvalsh(A_reg)
-        
-        # Ensure numerical stability (avoid dividing by zero)
-        eig_data = eig_data[eig_data > eig_tol]
-        eig_reg = eig_reg[eig_reg > eig_tol]
+        if self.Wx is not None:
+            if l1reg:
+                diag = torch.diag(self.Wx.T @ self.Wx)
+                A_reg += self.alphax *torch.diag(diag**0.5)
+            else:
+                A_reg += self.alphax * (self.Wx.T @ self.Wx)
+        if self.Ws is not None:
+            if l1reg:
+                A_reg += self.alphas * self.Ws
+            else:
+                A_reg += self.alphas * (self.Ws.T @ self.Ws)
 
-        # Use the ratio of eigenvalues to set beta range
-        lambda_d = torch.max(eig_data)
-        lambda_r = torch.min(eig_reg)
+        if norm:
+            lambda_d = torch.linalg.norm(A_data, ord=2)  # Spectral norm ≈ largest eigval
+            lambda_r = torch.linalg.norm(A_reg, ord=-2)  # Smallest eigval approx (not accurate, but fast)
+        else:
+            eig_data = torch.linalg.eigvalsh(A_data)
+            eig_reg = torch.linalg.eigvalsh(A_reg)
+            
+            # Ensure numerical stability (avoid dividing by zero)
+            eig_data = eig_data[eig_data > eig_tol]
+            eig_reg = eig_reg[eig_reg > eig_tol]
+
+            # Use the ratio of eigenvalues to set beta range
+            lambda_d = torch.max(eig_data)
+            lambda_r = torch.min(eig_reg)
         return beta0_ratio * lambda_d / lambda_r
   
     def compute_sensitivity(self,J):
         return  torch.sqrt(torch.sum(J**2, axis=0))
 
     def update_Ws(self, J):
-        Wd=self.Wd
-        Sensitivity = self.compute_sensitivity(Wd@J)
+        Sensitivity = self.compute_sensitivity(self.Wd@J)
         Sensitivity /= Sensitivity.max()
         Sensitivity = np.clip(Sensitivity, self.Ws_threshold, 1)
-        Ws = torch.diag(Sensitivity)
-        self.Ws = Ws
-        return Ws
+        self.Ws = torch.diag(Sensitivity)
 
-    def GradientDescentL1reg(self,mvec_init, niter, beta0, print_update=True, 
+    # def update_Ws(self, m):
+    #     """Approximate sensitivity using Jᵀ Wᵀ W J diag only (no full Jacobian)"""
+    #     m = m.detach().clone().requires_grad_(True)
+    #     nparam = m.numel()
+    #     sensitivity_sq = torch.zeros(nparam)
+
+    #     for i in range(nparam):
+    #         # Basis vector ei
+    #         ei = torch.zeros_like(m)
+    #         ei[i] = 1.0
+    #         # Compute J @ ei = directional derivative w.r.t. m_i
+    #         dpred, dFdm_i = self.Jvec(m, ei)
+    #         wr = self.Wd @ dFdm_i  # Wd @ column of J
+    #         sensitivity_sq[i] = torch.sum(wr ** 2)
+    #     self.Ws= torch.sqrt(sensitivity_sq)
+    #     return self.Ws
+
+    def GradientDescent(self,mvec_init, niter, beta0, l1reg=False, print_update=True, 
         coolingFactor=2.0, coolingRate=2, s0=1.0, sfac = 0.5,update_Wsen=False, 
         stol=1e-6, gtol=1e-3, mu=1e-4,ELS=True, BLS=True ):
 
@@ -617,18 +772,20 @@ class Optimization():  # Inherits from BaseSimulation
         self.data_prg = []
         self.mvec_prg = []
         
-        mvec_old = mvec_init
-        m_ref = mvec_init.detach()
+        mvec_old = mvec_init.detach().clone().requires_grad_(True)
+        m_ref = mvec_old.detach()
         beta= beta0
-
 
         for i in range(niter):
             beta =  beta0* torch.tensor(1.0 / (coolingFactor ** (i // coolingRate)))
-            J = self.J(mvec_old)
-            if update_Wsen:
-                self.update_Ws(J) 
 
-            f_old, phid, phim = self.loss_func_L1reg(mvec_old,beta=beta,m_ref=m_ref) 
+            if update_Wsen:
+                J = self.J(mvec_old)
+                self.update_Ws(J)
+            if l1reg:
+                f_old, phid, phim = self.loss_func_L1reg(mvec_old,beta=beta,m_ref=m_ref)
+            else:
+                f_old, phid, phim = self.loss_func_L2(mvec_old,beta=beta,m_ref=m_ref) 
             f_old.backward()   # Compute the gradient of f_old
 
             # if mvec_old.grad is not None:
@@ -641,8 +798,8 @@ class Optimization():  # Inherits from BaseSimulation
 
            # Exact line search
             if ELS:
-                A = self.Wd @ J             
-                t = torch.dot(g,g)/torch.dot(A@g,A@g)
+                dpred, Jg =self.Jvec(mvec_init,g)
+                t = torch.sum(g**2)/torch.sum((self.Wd @ Jg )**2)
             else:
                 t = 1.
 
@@ -654,16 +811,22 @@ class Optimization():  # Inherits from BaseSimulation
             s = torch.tensor(s0)
             dm = t*g.flatten()  # Ensure dm is a 1D tensor
             mvec_new = self.project_convex_set(mvec_old - s * dm)
-            f_new, phid, phim = self.loss_func_L1reg(mvec_new, beta=beta,m_ref=m_ref)
+            if l1reg:
+                f_new, phid, phim = self.loss_func_L1reg(mvec_new, beta=beta,m_ref=m_ref)
+            else:
+                f_new, phid, phim = self.loss_func_L2(mvec_new, beta=beta,m_ref=m_ref)
             directional_derivative = torch.dot(g.flatten(), -dm.flatten())
             if BLS:
                 while f_new >= f_old + s*torch.tensor(mu)* directional_derivative:
                     s *= torch.tensor(sfac)
                     mvec_new = self.project_convex_set(mvec_old - s * dm)
-                    f_new, phid, phim = self.loss_func_L1reg(mvec_new,beta=beta,m_ref=m_ref) 
+                    if l1reg:
+                        f_new, phid, phim = self.loss_func_L1reg(mvec_new,beta=beta,m_ref=m_ref)
+                    else:
+                        f_new, phid, phim = self.loss_func_L2(mvec_new,beta=beta,m_ref=m_ref) 
                     if s < torch.tensor(stol):
                         break
-            mvec_old = mvec_new.detach().clone().requires_grad_()
+            mvec_old = mvec_new.detach().clone().requires_grad_(True)
             if print_update:
                 print(f'{i + 1:3}, beta:{beta:.1e}, step:{s:.1e}, gradient:{g_norm:.1e},  f:{f_new:.1e}')
 
@@ -728,20 +891,3 @@ class Optimization():  # Inherits from BaseSimulation
                 print(f'{i + 1:3}, beta:{beta:.1e}, step:{s:.1e}, gradient:{g_norm:.1e},  f:{f_new:.1e}')
         return mvec_new
     
-class TEM_Signal_Process:
-    
-    def __init__(self,  
-        base_freq,on_time, rmp_time, rec_time, smp_freq,
-        windows_cen=None, windows_strt = None, windows_end = None):
-        self.base_freq = base_freq
-        self.on_time = on_time
-        self.rmp_time = rmp_time
-        self.rec_time = rec_time
-        self.smp_freq = smp_freq
-        time_step = 1./smp_freq
-        self.time_step = time_step
-        self.times_rec = np.arange(0,rec_time,time_step) + time_step
-        self.times_filt = np.arange(0,rec_time,time_step)
-        self.windows_cen= windows_cen
-        self.windows_strt = windows_strt
-        self.windows_end = windows_end
