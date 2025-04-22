@@ -82,17 +82,18 @@ class Debye_sum_f():
     def __init__(self,
             freq=None,
             times=None, tstep=None,
-            ntau=None,taus=None,
+            taus=None,
             reslim= [1e-2,1e5],
-            chglim= [1e-3, 0.9],
+            chglim= [0, 0.9],
             taulim= [1e-5, 1e1],
             taulimspc = [2,10],
                 ):
         self.times = TorchHelper.to_tensor_r(times) if times is not None else None
         self.tstep = TorchHelper.to_tensor_r(tstep) if tstep is not None else None
         self.freq = TorchHelper.to_tensor_c(freq) if freq is not None else None
-        self.ntau = ntau if ntau is not None else None
+        # self.ntau = ntau if ntau is not None else None
         self.taus = TorchHelper.to_tensor_c(taus) if taus is not None else None
+        self.ntau = len(taus) if taus is not None else None
         self.reslim = TorchHelper.to_tensor_r(np.log(reslim))
         self.chglim = TorchHelper.to_tensor_r(chglim)
         self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
@@ -110,15 +111,8 @@ class Debye_sum_f():
         """
         rho0 = torch.exp(p[0])
         etas = p[1:1 + self.ntau].to(dtype=torch.cfloat)
-        # if self.taus is None:
-        #     assert len(p) == 1 + 2 * self.ntau
-        #     taus = torch.exp(p[1 + self.ntau:1 + 2 * self.ntau])
-        # else:
-        #     assert len(p) == 1 + self.ntau
-            # taus = self.taus.to(dtype=torch.cfloat)
         omega = 2 * torch.pi * self.freq
         omega = omega.view(-1, 1)  # shape: [nfreq, 1]
-        # taus = taus.view(1, -1)  # shape: [1, ntau]
         taus = self.taus.view(1, -1)  # shape: [1, ntau]
         etas = etas.view(1, -1)  # shape: [1, ntau]
         iwt = 1j * omega * taus  # shape: [nfreq, ntau]
@@ -471,7 +465,7 @@ class InducedPolarizationSimulation(BaseSimulation):
             count_data[i] = ind_time.sum()
         return count_data
 
-    def get_freq_windowmat(self,tau, max=22):
+    def get_freq_windowmat(self,tau, max=22, ign_0=False):
         log2max = self.log2max
         log2min = self.log2min
         freqend = ((1 / tau) * 2 ** log2max).item()
@@ -641,7 +635,7 @@ class InducedPolarizationSimulation(BaseSimulation):
             # return self.window_mat@volt
 
         if self.mode=="sip_t":
-            self.get_freq_windowmat(tau=torch.exp(m[2]))
+            # self.get_freq_windowmat(tau=torch.exp(m[2]))
             f = self.ip_model.f(m)
             t = self.compute_fft(f)/(self.times[1]-self.times[0])
             t_real = t.real
@@ -751,7 +745,7 @@ class Optimization():  # Inherits from BaseSimulation
         # Prj_m = self.Prj_m  # Use `Proj_m` to map the model space
 
         # Effective data misfit term with projection matrix
-        A_data =  J.T @ self.Wd.T @ self.Wd @ J 
+        A_data = 0.5* J.T @ self.Wd.T @ self.Wd @ J 
         
         # Effective regularization term with projection matrix
         # A_reg = alphax* Prj_m.T @ Wx.T @ Wx @ Prj_m
@@ -761,12 +755,12 @@ class Optimization():  # Inherits from BaseSimulation
                 diag = torch.diag(self.Wx.T @ self.Wx)
                 A_reg += self.alphax *torch.diag(diag**0.5)
             else:
-                A_reg += self.alphax * (self.Wx.T @ self.Wx)
+                A_reg += 0.5*self.alphax * (self.Wx.T @ self.Wx)
         if self.Ws is not None:
             if l1reg:
                 A_reg += self.alphas * self.Ws
             else:
-                A_reg += self.alphas * (self.Ws.T @ self.Ws)
+                A_reg += 0.5*self.alphas * (self.Ws.T @ self.Ws)
 
         if norm:
             lambda_d = torch.linalg.norm(A_data, ord=2)  # Spectral norm ≈ largest eigval
