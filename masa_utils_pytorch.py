@@ -39,7 +39,7 @@ class TorchHelper:
             return torch.tensor(x, dtype=dtype, device=device)
 
 class Pelton_res_f():
-    def __init__(self, freq=None,
+    def __init__(self, freq=None, con=False,
             reslim= [1e-2,1e5],
             chglim= [1e-3, 0.9],
             taulim= [1e-8, 1e4],
@@ -50,19 +50,32 @@ class Pelton_res_f():
         self.chglim = TorchHelper.to_tensor_r(chglim)
         self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
         self.clim = TorchHelper.to_tensor_r(clim)
+        self.con = con
 
     def f(self,p):
         """
-        Pelton resistivity model made easy for PyTorch Auto Diffentiation.
-        p[0] : log(res0)
-        p[1] : eta
-        p[2] : log(tau)
-        p[3] : c
+        Return the Pelton resistivity model for PyTorch auto-differentiation.
+
+        **Parameters**
+        - `p` (`torch.Tensor`): Model parameters
+            - `p[0]` : log(res0)
+            - `p[1]` : eta
+            - `p[2]` : log(tau)
+            - `p[3]` : c
+
+        **Model Equation**
+
+        ```math
+        \rho(\omega) = \rho_0 \left[ 1 - \eta \left(1 - \frac{1}{1+(i\omega\tau)^c} \right) \right]
+        = \rho_0 \left[ \frac{\tau^{-c} + (1-\eta)(i\omega)^c}{\tau^{-c} + (i\omega)^c} \right]
+        ```
         """
         iwc = (1j * 2. * torch.pi * self.freq  ) ** p[3] 
         tc = torch.exp(-p[2]*p[3])
-        f = torch.exp(p[0])*(tc +(1.0-p[1])*iwc)/(tc+iwc)
-        return f        
+        if self.con:
+            return torch.exp(-p[0])/(tc +(1.0-p[1])*iwc)*(tc+iwc)
+        else:
+            return torch.exp(p[0])*(tc +(1.0-p[1])*iwc)/(tc+iwc)      
 
     def clip_model(self,mvec):
         # Clone to avoid modifying the original tensor
@@ -78,10 +91,64 @@ class Pelton_res_f():
         mvec_tmp[ind_c] = torch.clamp(mvec[ind_c], self.clim.min(), self.clim.max())
         return mvec_tmp
 
+class Pelton(Pelton_res_f):
+    """Alias for Pelton_res_f with a simplified name."""
+    pass
+
+class ColeCole_f():
+    def __init__(self, freq=None, res=False,
+            conlim= [1e-5,1e2],
+            chglim= [1e-3, 0.9],
+            taulim= [1e-8, 1e4],
+            clim= [0.2, 0.8]
+                ):
+        self.freq =  TorchHelper.to_tensor_c(freq)if freq is not None else None
+        self.res = res
+        self.reslim = TorchHelper.to_tensor_r(np.log(conlim))
+        self.chglim = TorchHelper.to_tensor_r(chglim)
+        self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
+        self.clim = TorchHelper.to_tensor_r(clim)
+
+    def f(self,p):
+        """
+        Return the Pelton resistivity model for PyTorch auto-differentiation.
+
+        **Parameters**
+        - `p` (`torch.Tensor`): Model parameters
+            - `p[0]` : log(con8)
+            - `p[1]` : eta
+            - `p[2]` : log(tau)
+            - `p[3]` : c
+
+        **Model Equation**
+
+        ```math
+        \sigma_\infty \left(1- \dfrac{\eta}{1+(i\omega \tau)^c}\right)
+        """
+        iwc = (1j * 2. * torch.pi * self.freq  ) ** p[3] 
+        tc = torch.exp(-p[2]*p[3])
+        if self.res:
+            return torch.exp(-p[0])/((1.0-p[1])*tc +iwc)*(tc+iwc)
+        else:
+            return torch.exp( p[0])*((1.0-p[1])*tc +iwc)/(tc+iwc)
+        
+    def clip_model(self,mvec):
+        # Clone to avoid modifying the original tensor
+        mvec_tmp = mvec.clone().detach()       
+        mvec_tmp[0] = torch.clamp(mvec[0], self.reslim.min(), self.reslim.max())
+        mvec_tmp[1] = torch.clamp(mvec[1], self.chglim.min(), self.chglim.max())
+        mvec_tmp[2] = torch.clamp(mvec[2], self.taulim.min(), self.taulim.max())
+        mvec_tmp[3] = torch.clamp(mvec[3], self.clim.min(), self.clim.max())
+        return mvec_tmp
+
+class ColeCole(ColeCole_f):
+    """Alias for ColeCole_f with a simplified name."""
+    pass
+
 class Debye_sum_f():
     def __init__(self,
             freq=None,
-            times=None, tstep=None,
+            times=None, tstep=None, con=False,
             taus=None,
             reslim= [1e-2,1e5],
             chglim= [0, 0.9],
@@ -91,9 +158,9 @@ class Debye_sum_f():
         self.times = TorchHelper.to_tensor_r(times) if times is not None else None
         self.tstep = TorchHelper.to_tensor_r(tstep) if tstep is not None else None
         self.freq = TorchHelper.to_tensor_c(freq) if freq is not None else None
-        # self.ntau = ntau if ntau is not None else None
         self.taus = TorchHelper.to_tensor_c(taus) if taus is not None else None
         self.ntau = len(taus) if taus is not None else None
+        self.con = con
         self.reslim = TorchHelper.to_tensor_r(np.log(reslim))
         self.chglim = TorchHelper.to_tensor_r(chglim)
         self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
@@ -108,16 +175,21 @@ class Debye_sum_f():
             p[1+ntau:1+2*ntau]: log(taus) (if taus not fixed)
         Returns:
             Complex-valued resistivity at each frequency.
+        ```Math
+        \rho(\omega)=\rho_0 \left[ 1 -\sum_{j=1}^n \eta_j + \sum_{j=1}^n \dfrac{\eta_j}{1+i\omega\tau_j}\right]
         """
         rho0 = torch.exp(p[0])
         etas = p[1:1 + self.ntau].to(dtype=torch.cfloat)
-        omega = 2 * torch.pi * self.freq
+        omega = 2.0 * torch.pi * self.freq
         omega = omega.view(-1, 1)  # shape: [nfreq, 1]
         taus = self.taus.view(1, -1)  # shape: [1, ntau]
         etas = etas.view(1, -1)  # shape: [1, ntau]
-        iwt = 1j * omega * taus  # shape: [nfreq, ntau]
-        term = -iwt * etas / (1 + iwt)  # shape: [nfreq, ntau]
-        return rho0 * (1 + term.sum(dim=1))  # shape: [nfreq]
+        iwt = 1.0j * omega * taus  # shape: [nfreq, ntau]
+        term =  etas / (1.0 + iwt)  # shape: [nfreq, ntau]
+        if self.con:
+            return 1.0/rho0 / (1.0 -etas.sum(dim=1)+ term.sum(dim=1))
+        else:
+            return rho0 * (1.0 -etas.sum(dim=1)+ term.sum(dim=1))  # shape: [nfreq]
 
     def clip_model(self,mvec):
         # Clone to avoid modifying the original tensor
@@ -152,20 +224,25 @@ class Debye_sum_f():
             proj_x = x
         return proj_x
 
+class Debye_Sum_Ser_f(Debye_sum_f):
+    """Alias for Debye_sum_f with a specific name."""
+    pass
+
 class Debye_sum_t():
     def __init__(self,
-            freq=None,
-            times=None, tstep=None,
-            ntau=None,taus=None,
+            times=None, tstep=None, taus=None,
             reslim= [1e-2,1e5],
             chglim= [1e-3, 0.9],
             taulim= [1e-5, 1e1],
             taulimspc = [2,10],
                 ):
+        assert np.all(times >= -eps), "Times must be greater than or equal to 0"
+        if len(times) > 1:
+            assert np.all(np.diff(times) >= -eps), "Time values must be in ascending order."
         self.times = TorchHelper.to_tensor_r(times) if times is not None else None
         self.tstep = TorchHelper.to_tensor_r(tstep) if tstep is not None else None
-        self.ntau = ntau if ntau is not None else None
         self.taus = TorchHelper.to_tensor_r(taus) if taus is not None else None
+        self.ntau = len(taus) if taus is not None else None
         self.reslim = TorchHelper.to_tensor_r(np.log(reslim))
         self.chglim = TorchHelper.to_tensor_r(chglim)
         self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
@@ -173,12 +250,14 @@ class Debye_sum_t():
 
     def t(self, p, tstep=None):
         """
-        Pelton linear weighted Debye model in time domain.
+        Time-Domain Debye-Combination Series Configuration in Resistivity form.
         Parameters:
             p[0]: log(rho0)
             p[1:1+ntau]: etas (relaxation weights)
         Returns:
             Real value resistivity given times.
+        ```Math
+        \rho(t)=\rho_0 \left[ \left(1 -\sum_{j=1}^n \eta_j \right) \delta(t)+ \sum_{j=1}^n \dfrac{\eta_j}{\tau_j}e^{\frac{-t}{\tau_j}}\right]
         """
         if tstep is not None:
             self.tstep = TorchHelper.to_tensor_r(tstep)
@@ -192,7 +271,7 @@ class Debye_sum_t():
         etas = etas.view(1, -1)  # shape: [1, ntau]
         term = etas/taus*torch.exp(-times/taus)  # shape: [ntime, ntau]
         term_sum = term.sum(dim=1)  # shape: [ntime]
-        term_sum[ind_0] = 1-etas.sum(dim=1)  # Set the value at t=0 to 1 - sum(etas)
+        term_sum[ind_0] = 1.0-etas.sum(dim=1)  # Set the value at t=0 to 1 - sum(etas)
         if self.tstep is not None:
             ind_pos = torch.where(self.times > 0)
             term_sum[ind_pos] *= self.tstep
@@ -233,43 +312,137 @@ class Debye_sum_t():
             proj_x = x
         return proj_x
 
-class ColeCole_f():
-    def __init__(self, freq=None, res=False,
+class Debye_Sum_Ser_t(Debye_sum_t):
+    """Alias for Debye_sum_t with a specific name."""
+    pass
+
+class Debye_Sum_Par_f():
+    def __init__(self,
+            freq=None, taus=None, res=False,
             conlim= [1e-5,1e2],
-            chglim= [1e-3, 0.9],
-            taulim= [1e-8, 1e4],
-            clim= [0.2, 0.8]
+            chglim= [0, 0.9],
+            taulim= [1e-5, 1e1],
+            taulimspc = [2,10],
                 ):
-        self.freq =  TorchHelper.to_tensor_c(freq)if freq is not None else None
-        self.res = res
-        self.reslim = TorchHelper.to_tensor_r(np.log(conlim))
+        self.freq = TorchHelper.to_tensor_c(freq) if freq is not None else None
+        self.taus = TorchHelper.to_tensor_c(taus) if taus is not None else None
+        self.ntau = len(taus) if taus is not None else None
+        self.res= res
+        self.conlim = TorchHelper.to_tensor_r(np.log(conlim))
         self.chglim = TorchHelper.to_tensor_r(chglim)
         self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
-        self.clim = TorchHelper.to_tensor_r(clim)
+        self.taulimspc = TorchHelper.to_tensor_r(np.log(taulimspc))
 
-    def f(self,p):
+    def f(self, p):
         """
-        Cole Cole conductivity model made easy for PyTorch Auto Diffentiation.
-        p[0] : log(con8)
-        p[1] : eta
-        p[2] : log(tau)
-        p[3] : c
+        Frequency domain Debye-Combination model Parallel configuration in Conductivity form.
+        Parameters:
+            p[0]: log(con8)
+            p[1:1+ntau]: etas (relaxation weights)
+        Returns:
+            Complex-valued conductivity at each frequency.
+        ```Math
+        \sigma(\omega)=\sigma_\infty\left(1- \sum_{j=1}^n\dfrac{\eta_j}{1+i\omega\tau_j}\right)
         """
-        iwc = (1j * 2. * torch.pi * self.freq  ) ** p[3] 
-        tc = torch.exp(-p[2]*p[3])
+        con8 = torch.exp(p[0])
+        etas = p[1:1 + self.ntau].to(dtype=torch.cfloat)
+        omega = 2.0 * torch.pi * self.freq
+        omega = omega.view(-1, 1)  # shape: [nfreq, 1]
+        taus = self.taus.view(1, -1)  # shape: [1, ntau]
+        etas = etas.view(1, -1)  # shape: [1, ntau]
+        iwt = 1.0j * omega * taus  # shape: [nfreq, ntau]
+        term = etas / (1.0 + iwt)  # shape: [nfreq, ntau]
         if self.res:
-            return torch.exp(-p[0])/((1.0-p[1])*tc +iwc)*(tc+iwc)
+            return 1.0/con8 / (1.0 - term.sum(dim=1))
         else:
-            return torch.exp( p[0])*((1.0-p[1])*tc +iwc)/(tc+iwc)
-        
+            return con8 * (1.0 - term.sum(dim=1))  # shape: [nfreq]
+
     def clip_model(self,mvec):
         # Clone to avoid modifying the original tensor
-        mvec_tmp = mvec.clone().detach()       
-        mvec_tmp[0] = torch.clamp(mvec[0], self.reslim.min(), self.reslim.max())
-        mvec_tmp[1] = torch.clamp(mvec[1], self.chglim.min(), self.chglim.max())
-        mvec_tmp[2] = torch.clamp(mvec[2], self.taulim.min(), self.taulim.max())
-        mvec_tmp[3] = torch.clamp(mvec[3], self.clim.min(), self.clim.max())
+        mvec_tmp = mvec.clone().detach()
+        ind_con = 0
+        ind_chg = 1+np.arange(self.ntau)
+        mvec_tmp[ind_con] = torch.clamp(mvec[ind_con], self.conlim.min(), self.conlim.max())
+        mvec_tmp[ind_chg] = torch.clamp(mvec[ind_chg], self.chglim.min(), self.chglim.max())
+        mvec_tmp[ind_chg] = self.proj_halfspace(mvec_tmp[ind_chg], torch.ones(self.ntau), self.chglim.max())
+        mvec_tmp[ind_chg] = self.proj_halfspace(mvec_tmp[ind_chg],-torch.ones(self.ntau), self.chglim.min())
         return mvec_tmp
+
+    def proj_halfspace(self, x, a, b):
+        ax = torch.dot(a, x)
+        if ax > b:
+            proj_x = x + a * ((b - ax) / torch.dot(a, a))
+        else:
+            proj_x = x
+        return proj_x
+
+class Debye_Sum_Par_t():
+    def __init__(self,
+            times=None, tstep=None, taus=None,
+            conlim= [1e-5,1e3],
+            chglim= [1e-3, 0.9],
+            taulim= [1e-5, 1e1],
+            taulimspc = [2,10],
+                ):
+        assert np.all(times >= -eps), "Times must be greater than or equal to 0"
+        if len(times) > 1:
+            assert np.all(np.diff(times) >= -eps), "Time values must be in ascending order."
+        self.times = TorchHelper.to_tensor_r(times) if times is not None else None
+        self.tstep = TorchHelper.to_tensor_r(tstep) if tstep is not None else None
+        self.taus = TorchHelper.to_tensor_r(taus) if taus is not None else None
+        self.ntau = len(taus) if taus is not None else None
+        self.conlim = TorchHelper.to_tensor_r(np.log(conlim))
+        self.chglim = TorchHelper.to_tensor_r(chglim)
+        self.taulim = TorchHelper.to_tensor_r(np.log(taulim))
+        self.taulimspc = TorchHelper.to_tensor_r(np.log(taulimspc))
+
+    def t(self, p, tstep=None):
+        """
+        Time-Domain Debye-Combination Parallel Configuration in Conductivity form.
+        Parameters:
+            p[0]: log(con8)
+            p[1:1+ntau]: etas (relaxation weights)
+        Returns:
+            Real value conductivity given times.
+        ```Math
+        \sigma(t)=\sigma_\infty \left[ \delta(t)- \sum_{j=1}^n \dfrac{\eta_j}{\tau_j}e^{\frac{-t}{\tau_j}}\right]
+        """
+        if tstep is not None:
+            self.tstep = TorchHelper.to_tensor_r(tstep)
+
+        con8 = torch.exp(p[0])
+        etas = p[1:1 + self.ntau]
+        ind_0 = torch.where(self.times == 0)[0]
+        times = self.times.view(-1, 1)  # shape: [ntime, 1]
+        taus = self.taus.view(1, -1)  # shape: [1, ntau]
+        etas = etas.view(1, -1)  # shape: [1, ntau]
+        term = etas/taus*torch.exp(-times/taus)  # shape: [ntime, ntau]
+        term_sum = term.sum(dim=1)  # shape: [ntime]
+        term_sum[ind_0] = 1  # Set the value at t=0 to 1 - sum(etas)
+        if self.tstep is not None:
+            ind_pos = torch.where(self.times > 0)
+            term_sum[ind_pos] *= self.tstep
+        return con8 * (term_sum)  # shape: [tau]
+
+    def clip_model(self,mvec):
+        # Clone to avoid modifying the original tensor
+        mvec_tmp = mvec.clone().detach()
+        ind_con = 0
+        ind_chg = 1+np.arange(self.ntau)
+    
+        mvec_tmp[ind_con] = torch.clamp(mvec[ind_con], self.conlim.min(), self.conlim.max())
+        mvec_tmp[ind_chg] = torch.clamp(mvec[ind_chg], self.chglim.min(), self.chglim.max())
+        mvec_tmp[ind_chg] = self.proj_halfspace(mvec_tmp[ind_chg], torch.ones(self.ntau), self.chglim.max())
+        mvec_tmp[ind_chg] = self.proj_halfspace(mvec_tmp[ind_chg],-torch.ones(self.ntau), self.chglim.min())
+        return mvec_tmp
+
+    def proj_halfspace(self, x, a, b):
+        ax = torch.dot(a, x)
+        if ax > b:
+            proj_x = x + a * ((b - ax) / torch.dot(a, a))
+        else:
+            proj_x = x
+        return proj_x
 
 class Pelton_res_f_two():
     def __init__(self, freq=None,
@@ -357,46 +530,6 @@ class Pelton_res_f_dual():
         ind_c = [3,6] 
     
         mvec_tmp[ind_res] = torch.clamp(mvec[ind_res], self.reslim.min(), self.reslim.max())
-        mvec_tmp[ind_chg] = torch.clamp(mvec[ind_chg], self.chglim.min(), self.chglim.max())
-        mvec_tmp[ind_tau] = torch.clamp(mvec[ind_tau], self.taulim.min(), self.taulim.max())
-        mvec_tmp[ind_c] = torch.clamp(mvec[ind_c], self.clim.min(), self.clim.max())
-        return mvec_tmp
-    
-class Pelton_con_f():
-    def __init__(self, freq=None,
-        conlim= [1e-2,1e5],
-        chglim= [1e-3, 0.9],
-        taulim= [1e-8, 1e4],
-        clim= [0.2, 0.8]
-            ):
-        self.freq =  torch.tensor(freq, dtype=torch.cfloat) if freq is not None else None
-        self.conlim = torch.tensor(np.log(conlim))
-        self.chglim = torch.tensor(chglim)
-        self.taulim = torch.tensor(np.log(taulim))
-        self.clim = torch.tensor(clim)
-
-    def f(self,p):
-        """
-        Pelton conductivity model made easy for PyTorch Auto Diffentiation.
-        p[0] : log(con8)
-        p[1] : eta
-        p[2] : log(tau)
-        p[3] : c
-        """
-        iwc = (1j * 2. * torch.pi * self.freq  ) ** p[3] 
-        tc = torch.exp(-p[2]*p[3])
-        f = torch.exp(p[0])*(1.0-p[1])*(tc +iwc)/(tc+(1.0-p[1])*iwc)
-        return f
-    
-    def clip_model(self,mvec):
-        # Clone to avoid modifying the original tensor
-        mvec_tmp = mvec.clone().detach()
-        ind_con = 0
-        ind_chg = 1
-        ind_tau = 2
-        ind_c = 3 
-    
-        mvec_tmp[ind_con] = torch.clamp(mvec[ind_con], self.conlim.min(), self.conlim.max())
         mvec_tmp[ind_chg] = torch.clamp(mvec[ind_chg], self.chglim.min(), self.chglim.max())
         mvec_tmp[ind_tau] = torch.clamp(mvec[ind_tau], self.taulim.min(), self.taulim.max())
         mvec_tmp[ind_c] = torch.clamp(mvec[ind_c], self.clim.min(), self.clim.max())
@@ -556,9 +689,6 @@ class InducedPolarizationSimulation(BaseSimulation):
         self.windows_end = windows_end
         self.windows_width = windows_end - windows_strt
 
-    def get_windows_linlog(self, windows_cen01):
-        logstep = np.log(windows_cen01.max()/windows_cen01.min())/len(windows_cen01)
-
     def get_window_matrix(self, times=None, sum=False):
         if times is not None:
             self.times = TorchHelper.to_tensor_r(times)
@@ -585,11 +715,40 @@ class InducedPolarizationSimulation(BaseSimulation):
         #         window_matrix[i+1, ind_time] = 1.0/(ind_time.sum())
         # self.window_mat = window_matrix
 
-    def set_current_wave(self, basefreq=None, duty=0.5):
+    def set_current_wave(self, basefreq=None, curr_duty=0.5):
+        """
+        Set the current wave for the simulation as rectangular wave form.
+        """
         if basefreq is not None:
             self.basefreq = basefreq
-        curr =  0.5*(1.0+signal.square(2*np.pi*(self.basefreq*self.times),duty=0.5))
+        curr =  0.5*(1.0+signal.square(2*np.pi*(self.basefreq*self.times),duty=curr_duty))
         self.curr = TorchHelper.to_tensor_r(curr)
+        self.curr_duty=  curr_duty
+
+    def get_windows_matrix_curr(self, smp_freq, nlin, nlin_strt, basefreq=None) :
+        """
+        Get the windows matrix based on currenqt wave form.
+        """
+        if basefreq is not None:
+            self.basefreq = basefreq
+        rec_time = 1/self.basefreq
+        time_step = 1/smp_freq
+        windows_lin = (np.arange(nlin)+nlin_strt)*time_step 
+        windows_log_strt = (nlin+nlin_strt)*time_step
+        logstep = np.log10(windows_lin[-1]/windows_lin[-2])
+        windows_log_end = self.curr_duty/self.basefreq
+        windows_log = 10**np.arange(
+            np.log10(windows_log_strt),
+            np.log10(windows_log_end), logstep)
+        windows_cen=np.r_[windows_lin, windows_log]
+        nhalf = len(windows_cen)
+        windows_cen = np.r_[windows_cen, self.curr_duty/self.basefreq + windows_cen]
+        self.get_windows(windows_cen)
+
+        self.windows_end[nhalf-1]  = self.curr_duty/self.basefreq
+        self.windows_strt[nhalf] = self.windows_strt[0] + self.curr_duty/self.basefreq
+        self.windows_end[-1] = 1/self.basefreq
+        self.get_window_matrix(times=self.times)
 
     def fft_convolve(self, d, f):
         """
@@ -612,7 +771,6 @@ class InducedPolarizationSimulation(BaseSimulation):
             ip_t=self.ip_model.t(m)
             volt = self.fft_convolve(ip_t,self.curr)[: len(self.times)]
             return self.window_mat@volt
-
 
         if self.mode=="tdip_f":
             ip_f = self.ip_model.f(m)
